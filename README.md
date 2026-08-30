@@ -134,11 +134,11 @@ sudo /opt/dynject/bin/dynject_loader -v
 - macOS Tahoe+ arm64e
 - SIP relaxed
 
---
+---
 
 ## Thanks
 
-- [CoreBedtime](https://github.com/CoreBedtime) main inspiration ammonia/playground
+- [CoreBedtime](https://github.com/CoreBedtime) main inspiration from ammonia/playground
 - [Zeyad Azima](https://zeyadazima.com/notes/osmrnotes/) great ressources
-and many others...
+- and many others...
 
