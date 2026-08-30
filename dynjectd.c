@@ -296,23 +296,26 @@ static int find_intercept_addresses(void) {
 static char g_dyld_value[4096];
 
 static const char * build_dyld_for_bundle(const char *bundle_id, char *out_buf, size_t out_size) {
-    int  i;
-    int  j;
-    int  first;
+    int i;
+    int j;
+    int first;
 
     strlcpy(out_buf, "DYLD_INSERT_LIBRARIES=", out_size);
     first = 1;
 
     for (i = 0; i < g_config.dylib_count; i++) {
         int should_inject = g_config.dylibs[i].default_allow;
+        const char *reason = should_inject ? "default allow" : "default deny";
 
         for (j = 0; j < g_config.dylibs[i].override_count; j++) {
-            if (strstr(bundle_id,
-                       g_config.dylibs[i].overrides[j].pattern) != NULL) {
+            if (strstr(bundle_id, g_config.dylibs[i].overrides[j].pattern) != NULL) {
                 should_inject = g_config.dylibs[i].overrides[j].allow;
+                reason = should_inject ? "override allow" : "override deny";
                 break;
             }
         }
+
+        VLOG("policy dylib[%d] %s: %s %s", i, g_config.dylibs[i].path, reason, should_inject ? "INJECT" : "skip");
 
         if (!should_inject) {
             continue;
@@ -325,7 +328,25 @@ static const char * build_dyld_for_bundle(const char *bundle_id, char *out_buf, 
         first = 0;
     }
 
-    return first ? NULL : out_buf; 
+    return first ? NULL : out_buf;
+}
+
+static int dylib_count_in_value(const char *dyld_value) {
+    const char *p;
+    int count;
+
+    p = strchr(dyld_value, '=');
+    if (p == NULL || *(p + 1) == '\0') {
+        return 0;
+    }
+
+    count = 1;
+    p++;
+    while (*p) {
+        if (*p == ':') count++;
+        p++;
+    }
+    return count;
 }
 
 static size_t read_remote_string(task_t task,
@@ -593,13 +614,13 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
         app_name = app_path;
     }
 
-    VLOG("caught pid=%-6d posix_spawn(%s)", (int)xpcproxy_pid, app_name);
+    VLOG("caught pid=%d posix_spawn(%s)", (int)xpcproxy_pid, app_name);
     (void)service_name;
 
     match_result = check_match(app_name, app_path);
 
     if (match_result != MATCH_INJECT) {
-        LOG("%d %s SKIP (%s)", (int)xpcproxy_pid, service_name, match_skip_reason(match_result));
+        LOG("%s SKIP (%s)", service_name, match_skip_reason(match_result));
         return 0;
     }
 
@@ -607,22 +628,23 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
 
     /* x5 points to xpcproxy envp array */
     if (thread_state->__x[5] == 0) {
-        LOG("%d %s SKIP (envp is NULL)", (int)xpcproxy_pid, service_name);
+        LOG("%s SKIP (envp is NULL)", service_name);
         return -1;
     }
 
-    const char *dyld_value;
-    dyld_value = build_dyld_for_bundle(service_name, g_dyld_value, sizeof(g_dyld_value));
+    VLOG("policy pid=%d evaluating dylib policies for bundle: %s", (int)xpcproxy_pid, service_name);
 
-    if (dyld_value == NULL) {
-      VLOG("match pid=%d %s (all dylibs denied by policy, skipping)", (int)xpcproxy_pid, app_name);
-      return 0;
+    build_dyld_for_bundle(service_name, g_dyld_value, sizeof(g_dyld_value));
+
+    if (g_dyld_value[strlen("DYLD_INSERT_LIBRARIES=")] == '\0') {
+        LOG("%s SKIP (no dylibs allowed for this bundle)", service_name);
+        return 0;
     }
 
-    new_envp_address = make_envp_with_dyld( task, (mach_vm_address_t)thread_state->__x[5], dyld_value);
+    new_envp_address = make_envp_with_dyld(task, (mach_vm_address_t)thread_state->__x[5], g_dyld_value);
 
     if (new_envp_address == 0) {
-        LOG("%d %s SKIP (make_envp_with_dyld failed)", (int)xpcproxy_pid, service_name);
+        LOG("%s SKIP (make_envp_with_dyld failed)", service_name);
         return -1;
     }
 
@@ -630,11 +652,12 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
 
     kr = thread_set_state(exc_thread, ARM_THREAD_STATE64, (thread_state_t)thread_state, state_count);
     if (kr != KERN_SUCCESS) {
-        LOG("%d %s SKIP (thread_set_state: %s)", (int)xpcproxy_pid, service_name, mach_error_string(kr));
+        LOG("%s SKIP (thread_set_state: %s)", service_name, mach_error_string(kr));
         return -1;
     }
 
-    LOG("%d %s:%s INJECTED", (int)xpcproxy_pid, service_name, app_name);
+    LOG("%s(%s) MATCH (%d dylib(s) injected)", service_name, app_name, dylib_count_in_value(g_dyld_value));
+
     return 1;
 }
 
@@ -670,17 +693,17 @@ static void * xpc_handler_thread(void *raw_args) {
     kr = receive_exception(exc_port, BP_WAIT_TIMEOUT_MS, &exc_request);
 
     if (kr == MACH_RCV_TIMED_OUT) {
-        LOG("%d %s SKIP (timeout)", (int)pid, service_name);
+        LOG("%s SKIP (timeout)", service_name);
         goto cleanup;
     }
 
     if (kr != MACH_MSG_SUCCESS) {
-        LOG("%d %s  SKIP (mach_msg error: %s)", (int)pid, "?", mach_error_string(kr));
+        LOG("%s SKIP (mach_msg error: %s)", service_name, mach_error_string(kr));
         goto cleanup;
     }
 
     if (exc_request.exception_type != EXC_BREAKPOINT) {
-        VLOG("ERROR pid=%-6d unexpected exception type %d", (int)pid, (int)exc_request.exception_type);
+        VLOG("ERROR pid=%d unexpected exception type %d", (int)pid, (int)exc_request.exception_type);
         send_exception_reply(&exc_request.header, KERN_SUCCESS);
         mach_port_deallocate(mach_task_self(), exc_request.thread_port.name);
         mach_port_deallocate(mach_task_self(), exc_request.task_port.name);
@@ -712,10 +735,10 @@ static void * xpc_handler_thread(void *raw_args) {
         read_remote_string(task, thread_state.__x[0], app_path, sizeof(app_path));
         app_name = strrchr(app_path, '/');
         app_name = (app_name != NULL) ? (app_name + 1) : app_path;
-        LOG("%d %s SKIP (execve path)", (int)pid, service_name);
+        LOG("%s SKIP (execve path)", service_name);
 
     } else {
-        VLOG("ERROR pid=%-6d unexpected bp @0x%llx", (int)pid, (unsigned long long)pc_raw);
+        VLOG("ERROR pid=%d unexpected bp @0x%llx", (int)pid, (unsigned long long)pc_raw);
     }
 
     send_exception_reply(&exc_request.header, KERN_SUCCESS);
@@ -884,17 +907,17 @@ static void handle_auth_exec(es_client_t *client, const es_message_t *message) {
     }
 
     service_token = es_exec_arg(&message->event.exec, 1);
-    VLOG("%d %.*s evaluating bundleID", (int)pid, (int)service_token.length, service_token.data);
+    VLOG("pid=%d %.*s evaluating bundleID", (int)pid, (int)service_token.length, service_token.data);
 
     if (service_token.data != NULL && service_token.length > 0) {
         if (service_name_is_system_daemon(service_token.data, service_token.length)) {
-            LOG("%d %.*s SKIP (system_daemon)", (int)pid, (int)service_token.length, service_token.data);
+            LOG("%.*s SKIP (system_daemon)", (int)service_token.length, service_token.data);
             es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
             return;
         }
 
         if (!bundle_id_wants_injection(service_token.data, service_token.length)) {
-            VLOG("%d %.*s SKIP (not UI bundle)", (int)pid, (int)service_token.length, service_token.data);
+            VLOG("%.*s SKIP (not UI bundle)", (int)service_token.length, service_token.data);
             es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
             return;
         }
@@ -909,7 +932,7 @@ static void handle_auth_exec(es_client_t *client, const es_message_t *message) {
     kr   = task_for_pid(mach_task_self(), pid, &task);
 
     if (kr != KERN_SUCCESS) {
-        LOG("%d %s SKIP (task_for_pid: %s)", (int)pid, "xpcproxy", mach_error_string(kr));
+        LOG("%s SKIP (task_for_pid: %s)", "xpcproxy", mach_error_string(kr));
         es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
         return;
     }
@@ -936,7 +959,7 @@ static void handle_auth_exec(es_client_t *client, const es_message_t *message) {
     kr = task_set_exception_ports(task, EXC_MASK_BREAKPOINT, exc_port,
                                   EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
     if (kr != KERN_SUCCESS) {
-        LOG("%d %.*s SKIP (task_set_exception_ports: %s)", (int)pid, (int)service_token.length,
+        LOG("%.*s SKIP (task_set_exception_ports: %s)", (int)service_token.length,
             service_token.data, mach_error_string(kr));
         mach_port_deallocate(mach_task_self(), task);
         mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
@@ -945,7 +968,7 @@ static void handle_auth_exec(es_client_t *client, const es_message_t *message) {
     }
 
     if (set_hw_bps(task, 1) != 0) {
-        LOG("%d %.*s SKIP (set_hw_bps failed)", (int)pid, (int)service_token.length, service_token.data);
+        LOG("%.*s SKIP (set_hw_bps failed)", (int)service_token.length, service_token.data);
         mach_port_deallocate(mach_task_self(), task);
         mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
         es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
@@ -1026,13 +1049,11 @@ int main(int argc, char *argv[]) {
     LOG("starting");
 
     for (i = 0; i < g_config.dylib_count; i++) {
-        LOG("dylib[%d]  %s  (%s%s%d override%s)",
+        LOG("dylib[%d] %s (%s, %d override(s))",
             i,
             g_config.dylibs[i].path,
             g_config.dylibs[i].default_allow ? "allow-all" : "deny-all",
-            g_config.dylibs[i].override_count > 0 ? ", " : "",
-            g_config.dylibs[i].override_count,
-            g_config.dylibs[i].override_count == 1 ? "" : "s");
+            g_config.dylibs[i].override_count);
     }
 
     es_client    = NULL;
