@@ -132,7 +132,7 @@ sudo /opt/dynject/bin/dynject_loader -v
 ## Requirements
 
 - macOS Tahoe+ arm64e
-- SIP relaxed
+- SIP relaxed (`csrutil enable --without fs --without debug`)
 
 ---
 
