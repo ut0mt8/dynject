@@ -325,6 +325,12 @@ static const char* build_dyld_for_bundle(const char* bundle_id, char* out_buf,
       continue;
     }
 
+    if (access(g_config.dylibs[i].path, F_OK) != 0) {
+      LOG("SKIP dylib[%d] %s: file not found (remove from config to suppress)",
+          i, g_config.dylibs[i].path);
+      continue;
+    }
+
     if (!first) {
       strlcat(out_buf, ":", out_size);
     }
