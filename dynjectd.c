@@ -295,8 +295,6 @@ static int find_intercept_addresses(void) {
   return 0;
 }
 
-static char g_dyld_value[4096];
-
 static const char* build_dyld_for_bundle(const char* bundle_id, char* out_buf,
                                          size_t out_size) {
   int i;
@@ -399,6 +397,13 @@ static uint64_t read_remote_u64(task_t task, mach_vm_address_t remote_address) {
   return value;
 }
 
+static size_t envp_pointer_count(int existing_count, int has_dyld,
+                                 size_t capacity) {
+  if (existing_count < 0) return 0;
+  size_t required = (size_t)existing_count + (has_dyld ? 0 : 1) + 1;
+  return required <= capacity ? required : 0;
+}
+
 static mach_vm_address_t make_envp_with_dyld(
     task_t task, mach_vm_address_t original_envp_address,
     const char* dyld_value) {
@@ -406,7 +411,8 @@ static mach_vm_address_t make_envp_with_dyld(
   int existing_count;
   int dyld_entry_index;
 
-  mach_vm_address_t new_ptr_array[512];
+  /* 511 existing entries, one new DYLD entry, and the NULL terminator. */
+  mach_vm_address_t new_ptr_array[513];
   int new_count;
 
   size_t dyld_string_len;
@@ -448,8 +454,22 @@ static mach_vm_address_t make_envp_with_dyld(
     existing_count++;
   }
 
+  /* Do not silently drop the remainder of an unusually large environment. */
+  if (i == 511 &&
+      read_remote_u64(task, original_envp_address + (mach_vm_address_t)(i * 8)) != 0) {
+    LOG("SKIP envp: too many entries");
+    return 0;
+  }
+
   dyld_string_len = strlen(dyld_value) + 1;
-  ptr_array_bytes = (size_t)(existing_count + 2) * 8;
+  size_t pointer_count = envp_pointer_count(
+      existing_count, dyld_entry_index >= 0,
+      sizeof(new_ptr_array) / sizeof(new_ptr_array[0]));
+  if (pointer_count == 0) {
+    LOG("SKIP envp: pointer array capacity exceeded");
+    return 0;
+  }
+  ptr_array_bytes = pointer_count * sizeof(new_ptr_array[0]);
   total_allocation = ptr_array_bytes + dyld_string_len + 16;
 
   allocation_base = 0;
@@ -606,6 +626,7 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
                                  arm_thread_state64_t* thread_state,
                                  mach_msg_type_number_t state_count) {
   char app_path[PATH_MAX];
+  char dyld_value[4096];
   const char* app_name;
   MatchResult match_result;
   mach_vm_address_t new_envp_address;
@@ -643,15 +664,15 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
   VLOG("policy pid=%d evaluating dylib policies for bundle: %s",
        (int)xpcproxy_pid, service_name);
 
-  build_dyld_for_bundle(service_name, g_dyld_value, sizeof(g_dyld_value));
+  build_dyld_for_bundle(service_name, dyld_value, sizeof(dyld_value));
 
-  if (g_dyld_value[strlen("DYLD_INSERT_LIBRARIES=")] == '\0') {
+  if (dyld_value[strlen("DYLD_INSERT_LIBRARIES=")] == '\0') {
     LOG("%s SKIP (no dylibs allowed for this bundle)", service_name);
     return 0;
   }
 
   new_envp_address = make_envp_with_dyld(
-      task, (mach_vm_address_t)thread_state->__x[5], g_dyld_value);
+      task, (mach_vm_address_t)thread_state->__x[5], dyld_value);
 
   if (new_envp_address == 0) {
     LOG("%s SKIP (make_envp_with_dyld failed)", service_name);
@@ -668,7 +689,7 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
   }
 
   LOG("%s(%s) MATCH (%d dylib(s) injected)", service_name, app_name,
-      dylib_count_in_value(g_dyld_value));
+      dylib_count_in_value(dyld_value));
 
   return 1;
 }

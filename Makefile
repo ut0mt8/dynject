@@ -22,9 +22,13 @@ CFLAGS = \
 CFLAGS_DAEMON = $(CFLAGS) -lEndpointSecurity -lbsm
 CFLAGS_LOADER = $(CFLAGS) -lobjc
 
-.PHONY: all clean install uninstall load unload
+.PHONY: all clean install uninstall load unload test
 
 all: $(BINARY_DAEMON) $(BINARY_LOADER)
+
+test: | $(BUILD_DIR)
+	$(CC) $(CFLAGS_DAEMON) -o $(BUILD_DIR)/test_daemon_policy tests/test_daemon_policy.c log.c
+	$(BUILD_DIR)/test_daemon_policy
 
 $(BUILD_DIR):
 	@mkdir -p $@
