@@ -5,7 +5,7 @@ LAUNCH_DAEMONS = /Library/LaunchDaemons
 BINARY_DAEMON = $(BUILD_DIR)/dynjectd
 BINARY_LOADER = $(BUILD_DIR)/dynject_loader
 SOURCE_DAEMON = dynjectd.c
-SOURCE_LOADER = dynject_loader.c
+SOURCE_LOADER = dynject_loader.c amfid_stub.s
 ENTITLEMENTS  = dynjectd.entitlements
 PLIST         = com.dynject.dynjectd.plist
 
@@ -29,6 +29,8 @@ all: $(BINARY_DAEMON) $(BINARY_LOADER)
 test: | $(BUILD_DIR)
 	$(CC) $(CFLAGS_DAEMON) -o $(BUILD_DIR)/test_daemon_policy tests/test_daemon_policy.c log.c
 	$(BUILD_DIR)/test_daemon_policy
+	$(CC) $(CFLAGS_LOADER) -o $(BUILD_DIR)/test_amfid_stub tests/test_amfid_stub.c amfid_stub.s log.c
+	$(BUILD_DIR)/test_amfid_stub
 
 $(BUILD_DIR):
 	@mkdir -p $@
