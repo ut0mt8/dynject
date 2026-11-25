@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <ptrauth.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +34,11 @@
 #define MAX_RULES 128
 
 #define HW_BP_BCR_ENABLE 0x1E5U
-#define BP_WAIT_TIMEOUT_MS 300
+/* How long a launch may take to reach posix_spawn. xpcproxy needs more than
+ * a few hundred ms on a busy system (at login, or when many apps start at
+ * once); the wait ends early when the process is gone. */
+#define BP_WAIT_TIMEOUT_MS 10000
+#define BP_WAIT_SLICE_MS 250
 
 typedef struct {
   struct {
@@ -56,10 +61,90 @@ typedef struct {
 
 static Config g_config;
 
+/* Problems found while reading the config. main() logs them once the log is
+ * open; config_load runs before that. */
+#define MAX_CONFIG_WARNINGS 16
+static char g_config_warnings[MAX_CONFIG_WARNINGS][PATH_MAX + 160];
+static int g_config_warning_count;
+
+__attribute__((format(printf, 1, 2))) static void config_warn(const char* fmt,
+                                                              ...) {
+  va_list args;
+
+  if (g_config_warning_count < MAX_CONFIG_WARNINGS) {
+    va_start(args, fmt);
+    vsnprintf(g_config_warnings[g_config_warning_count],
+              sizeof(g_config_warnings[0]), fmt, args);
+    va_end(args);
+  }
+  g_config_warning_count++;
+}
+
 static void config_set_defaults(void) {
   memset(&g_config, 0, sizeof(g_config));
   g_config.inject_ui_apps = 1;
   g_config.skip_helpers = 1;
+  g_config_warning_count = 0;
+}
+
+/* yes/no settings. Anything that isn't a known word keeps the current value
+ * and is reported, instead of counting as yes. */
+static void config_set_bool(int* setting, const char* key, const char* value,
+                            int line_no) {
+  static const char* off[] = {"no", "0", "false", "off", NULL};
+  static const char* on[] = {"yes", "1", "true", "on", NULL};
+  int i;
+
+  for (i = 0; off[i] != NULL; i++) {
+    if (strcasecmp(value, off[i]) == 0) {
+      *setting = 0;
+      return;
+    }
+  }
+  for (i = 0; on[i] != NULL; i++) {
+    if (strcasecmp(value, on[i]) == 0) {
+      *setting = 1;
+      return;
+    }
+  }
+  config_warn("line %d: %s:%s is neither yes nor no; keeping %s", line_no, key,
+              value, *setting ? "yes" : "no");
+}
+
+/* dylib-override lines as read. They are matched to their dylib once the
+ * whole file is read, so one written above its dylib line still counts. */
+typedef struct {
+  char path[PATH_MAX];
+  char pattern[256];
+  int allow;
+  int line_no;
+} PendingOverride;
+
+static void config_attach_overrides(const PendingOverride* pending,
+                                    int count) {
+  int k;
+  int i;
+
+  for (k = 0; k < count; k++) {
+    for (i = 0; i < g_config.dylib_count; i++) {
+      if (strcmp(g_config.dylibs[i].path, pending[k].path) == 0) break;
+    }
+    if (i == g_config.dylib_count) {
+      config_warn("line %d: dylib-override for %s, which has no dylib line; "
+                  "ignored",
+                  pending[k].line_no, pending[k].path);
+      continue;
+    }
+    int oi = g_config.dylibs[i].override_count;
+    if (oi >= MAX_OVERRIDES) {
+      config_warn("line %d: more than %d overrides for %s; ignored",
+                  pending[k].line_no, MAX_OVERRIDES, pending[k].path);
+      continue;
+    }
+    strlcpy(g_config.dylibs[i].overrides[oi].pattern, pending[k].pattern, 256);
+    g_config.dylibs[i].overrides[oi].allow = pending[k].allow;
+    g_config.dylibs[i].override_count++;
+  }
 }
 
 static void config_load(const char* path) {
@@ -70,6 +155,10 @@ static void config_load(const char* path) {
   char* key;
   char* value;
   size_t len;
+  PendingOverride* pending = NULL;
+  int pending_count = 0;
+  int pending_capacity = 0;
+  int line_no = 0;
 
   file = fopen(path, "r");
   if (file == NULL) {
@@ -77,6 +166,7 @@ static void config_load(const char* path) {
   }
 
   while (fgets(line, sizeof(line), file) != NULL) {
+    line_no++;
     s = line;
     while (*s == ' ' || *s == '\t') {
       s++;
@@ -103,7 +193,11 @@ static void config_load(const char* path) {
       value++;
     }
 
-    if (strcmp(key, "dylib") == 0 && g_config.dylib_count < MAX_DYLIBS) {
+    if (strcmp(key, "dylib") == 0 && g_config.dylib_count >= MAX_DYLIBS) {
+      config_warn("line %d: more than %d dylib lines; ignored", line_no,
+                  MAX_DYLIBS);
+
+    } else if (strcmp(key, "dylib") == 0) {
       char dylib_path[PATH_MAX];
       int default_allow = 1;
       char* colon = strchr(value, ':');
@@ -129,7 +223,6 @@ static void config_load(const char* path) {
       char* p1;
       char* p2;
       char* p3;
-      int i;
 
       p1 = strchr(value, ':');
       if (p1 == NULL) continue;
@@ -150,18 +243,26 @@ static void config_load(const char* path) {
       p3 = p2 + 1;
       strlcpy(pattern, p3, sizeof(pattern));
 
-      for (i = 0; i < g_config.dylib_count; i++) {
-        if (strcmp(g_config.dylibs[i].path, dylib_path) != 0) {
+      if (pending_count == pending_capacity) {
+        int capacity = pending_capacity == 0 ? 16 : pending_capacity * 2;
+        PendingOverride* grown = realloc(pending, (size_t)capacity * sizeof(*pending));
+        if (grown == NULL) {
+          config_warn("line %d: out of memory; dylib-override ignored", line_no);
           continue;
         }
-        int oi = g_config.dylibs[i].override_count;
-        if (oi >= MAX_OVERRIDES) break;
-        strlcpy(g_config.dylibs[i].overrides[oi].pattern, pattern, 256);
-        g_config.dylibs[i].overrides[oi].allow =
-            (strcmp(policy_str, "allow") == 0) ? 1 : 0;
-        g_config.dylibs[i].override_count++;
-        break;
+        pending = grown;
+        pending_capacity = capacity;
       }
+      strlcpy(pending[pending_count].path, dylib_path, PATH_MAX);
+      strlcpy(pending[pending_count].pattern, pattern, 256);
+      pending[pending_count].allow = (strcmp(policy_str, "allow") == 0) ? 1 : 0;
+      pending[pending_count].line_no = line_no;
+      pending_count++;
+
+    } else if ((strcmp(key, "allow") == 0 && g_config.allow_count >= MAX_RULES) ||
+               (strcmp(key, "deny") == 0 && g_config.deny_count >= MAX_RULES)) {
+      config_warn("line %d: more than %d %s rules; ignored", line_no, MAX_RULES,
+                  key);
 
     } else if (strcmp(key, "allow") == 0 && g_config.allow_count < MAX_RULES) {
       strlcpy(g_config.allow_rules[g_config.allow_count], value, PATH_MAX);
@@ -172,16 +273,16 @@ static void config_load(const char* path) {
       g_config.deny_count++;
 
     } else if (strcmp(key, "ui_apps") == 0) {
-      g_config.inject_ui_apps =
-          (strcmp(value, "no") != 0 && strcmp(value, "0") != 0);
+      config_set_bool(&g_config.inject_ui_apps, key, value, line_no);
 
     } else if (strcmp(key, "skip_helpers") == 0) {
-      g_config.skip_helpers =
-          (strcmp(value, "no") != 0 && strcmp(value, "0") != 0);
+      config_set_bool(&g_config.skip_helpers, key, value, line_no);
     }
   }
 
   fclose(file);
+  config_attach_overrides(pending, pending_count);
+  free(pending);
 }
 
 typedef enum {
@@ -792,6 +893,39 @@ static kern_return_t receive_exception(mach_port_t port, int timeout_ms,
                   (mach_msg_timeout_t)timeout_ms, MACH_PORT_NULL);
 }
 
+/* A task's port turns into a dead name when the task ends. */
+static int task_is_gone(task_t task) {
+  mach_port_type_t type = 0;
+
+  return mach_port_type(mach_task_self(), task, &type) != KERN_SUCCESS ||
+         (type & MACH_PORT_TYPE_DEAD_NAME) != 0;
+}
+
+/* Waits up to max_ms for a message, in slices, and gives up early if the
+ * task has ended. Returns what mach_msg returned; MACH_RCV_TIMED_OUT with
+ * *gone set means the task ended first. */
+static kern_return_t wait_for_exception(mach_port_t port, task_t task,
+                                        int max_ms, ExceptionRequest* request,
+                                        int* gone) {
+  int waited = 0;
+
+  *gone = 0;
+  for (;;) {
+    int slice = max_ms - waited;
+    kern_return_t kr;
+
+    if (slice > BP_WAIT_SLICE_MS) slice = BP_WAIT_SLICE_MS;
+    kr = receive_exception(port, slice, request);
+    if (kr != MACH_RCV_TIMED_OUT) return kr;
+    waited += slice;
+    if (waited >= max_ms) return kr;
+    if (task_is_gone(task)) {
+      *gone = 1;
+      return kr;
+    }
+  }
+}
+
 #define MACH_EXCEPTION_RAISE_ID 2405
 
 /* The target can read its own exception port (task_get_exception_ports) and
@@ -985,6 +1119,7 @@ static void* xpc_handler_thread(void* raw_args) {
   kern_return_t kr;
   char app_path[PATH_MAX];
   const char* app_name;
+  int gone;
 
   args = (XpcHandlerArgs*)raw_args;
   task = args->task;
@@ -994,11 +1129,19 @@ static void* xpc_handler_thread(void* raw_args) {
   strlcpy(service_name, args->service_name, sizeof(service_name));
   free(args);
 
-  kr = receive_exception(exc_port, BP_WAIT_TIMEOUT_MS, &exc_request);
+  kr = wait_for_exception(exc_port, task, BP_WAIT_TIMEOUT_MS, &exc_request,
+                          &gone);
 
   if (kr == MACH_RCV_TIMED_OUT) {
-    LOG("%s SKIP (timeout)", service_name);
-    goto cleanup;
+    /* Take the breakpoints out, then look once more: a thread that hit one
+     * while we were giving up is waiting for an answer, and would die with
+     * the port. */
+    set_hw_bps(task, 0);
+    kr = receive_exception(exc_port, 0, &exc_request);
+    if (kr == MACH_RCV_TIMED_OUT) {
+      LOG("%s SKIP (%s)", service_name, gone ? "launch ended" : "timeout");
+      goto cleanup;
+    }
   }
 
   if (kr != MACH_MSG_SUCCESS) {
@@ -1162,13 +1305,27 @@ static const char* g_daemon_patterns[] = {
   "siri.context.service",
   NULL };
 
+/* A name on the list counts only as a whole word of the label: it starts
+ * the label or follows a '.', and no lowercase letter follows it. So "bird"
+ * matches com.apple.bird but not an app called Thunderbird, and "logd" still
+ * matches com.apple.logd_helper. */
 static int service_name_is_system_daemon(const char* service_name,
                                          size_t service_len) {
   int i;
 
   for (i = 0; g_daemon_patterns[i] != NULL; i++) {
-    if (strnstr(service_name, g_daemon_patterns[i], service_len) != NULL) {
-      return 1;
+    const char* pattern = g_daemon_patterns[i];
+    size_t pattern_len = strlen(pattern);
+    size_t at;
+
+    for (at = 0; at + pattern_len <= service_len; at++) {
+      if (at > 0 && service_name[at - 1] != '.') continue;
+      if (memcmp(service_name + at, pattern, pattern_len) != 0) continue;
+      if (pattern[pattern_len - 1] == '.' || at + pattern_len == service_len) {
+        return 1;
+      }
+      char next = service_name[at + pattern_len];
+      if (next < 'a' || next > 'z') return 1;
     }
   }
 
@@ -1389,6 +1546,14 @@ int main(int argc, char* argv[]) {
   log_init("dynjectd", log_path, verbose);
 
   LOG("starting");
+
+  for (i = 0; i < g_config_warning_count && i < MAX_CONFIG_WARNINGS; i++) {
+    LOG("config: %s", g_config_warnings[i]);
+  }
+  if (g_config_warning_count > MAX_CONFIG_WARNINGS) {
+    LOG("config: %d more problem(s) not shown",
+        g_config_warning_count - MAX_CONFIG_WARNINGS);
+  }
 
   for (i = 0; i < g_config.dylib_count; i++) {
     LOG("dylib[%d] %s (%s, %d override(s))", i, g_config.dylibs[i].path,

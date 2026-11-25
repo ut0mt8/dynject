@@ -54,6 +54,7 @@ sudo make load
 #
 # Location: /opt/dynject/etc/dynjectd.conf
 # Reload:   sudo launchctl kickstart -k system/com.dynject.dynjectd
+#           (the loader stops the running dynjectd and starts a new one)
 #
 # dylib:path:allow          inject into all matched processes (default)
 # dylib:path:deny           inject into no processes unless overridden
@@ -61,6 +62,9 @@ sudo make load
 #
 # dylib-override:path:allow:bundle_pattern   inject for matching bundle IDs
 # dylib-override:path:deny:bundle_pattern    skip for matching bundle IDs
+#
+# An override may stand before or after its dylib line. One that names a path
+# with no dylib line is ignored and reported in the log ("config: ...").
 #
 # bundle_pattern is matched as a substring against the XPC service bundle ID.
 # First matching override wins; falls back to the dylib's default policy.
@@ -98,6 +102,7 @@ sudo make load
 
 # ── Default UI app rule ───────────────────────────────────────────────
 # Inject into processes inside standard .app bundles.
+# yes/no settings take yes, no, true, false, on, off, 1 or 0.
 ui_apps:yes
 
 # ── Helper filtering ──────────────────────────────────────────────────

@@ -395,6 +395,132 @@ static void check_verified_policy(void) {
   g_config.dylibs[0].override_count = 0;
 }
 
+static int is_daemon(const char* label) {
+  return service_name_is_system_daemon(label, strlen(label));
+}
+
+/* Names on the daemon list count as whole words of a label. */
+static void check_daemon_names(void) {
+  assert(is_daemon("com.apple.bird"));
+  assert(is_daemon("bird"));
+  assert(is_daemon("com.apple.logd_helper"));
+  assert(is_daemon("com.apple.trustdFileHelper"));
+  assert(is_daemon("com.apple.security.cloudkeychainproxy3"));
+  assert(is_daemon("com.apple.mdworker.shared.01000000-0500-0000-0000-000000000000"));
+  assert(is_daemon("com.apple.AddressBook.abd"));
+  assert(is_daemon("com.apple.symptomsd-diag"));
+  assert(is_daemon("com.apple.WebKit.WebContent.6F0C0A7E"));
+  assert(!is_daemon("application.org.mozilla.thunderbird.123.456"));
+  assert(!is_daemon("application.com.example.blogdesk.1.2"));
+  assert(!is_daemon("application.com.example.birdfeed.1.2"));
+  assert(!is_daemon("application.com.apple.Safari.1.2"));
+  assert(!is_daemon("bir"));
+}
+
+static void load_config(const char* text) {
+  write_file("build/test.conf", text);
+  config_set_defaults();
+  config_load("build/test.conf");
+}
+
+static int warned(const char* text) {
+  for (int i = 0; i < g_config_warning_count && i < MAX_CONFIG_WARNINGS; i++) {
+    if (strstr(g_config_warnings[i], text) != NULL) return 1;
+  }
+  return 0;
+}
+
+static void check_config(void) {
+  static Config saved;
+  saved = g_config; /* the other checks use the config main() set up */
+
+  /* yes/no: the usual words, any case; anything else keeps the value and says so */
+  load_config("ui_apps:false\nskip_helpers:OFF\ndylib:/x.dylib\n");
+  assert(g_config.inject_ui_apps == 0 && g_config.skip_helpers == 0);
+  assert(g_config_warning_count == 0);
+  load_config("ui_apps:no\nui_apps:True\nskip_helpers:0\nskip_helpers:on\n");
+  assert(g_config.inject_ui_apps == 1 && g_config.skip_helpers == 1);
+  load_config("ui_apps:no\nui_apps:nope\nskip_helpers:maybe\n");
+  assert(g_config.inject_ui_apps == 0 && g_config.skip_helpers == 1);
+  assert(g_config_warning_count == 2 && warned("line 2: ui_apps:nope") && warned("skip_helpers:maybe"));
+
+  /* an override counts wherever it stands; file order decides between overrides */
+  load_config("dylib-override:/x.dylib:deny:com.apple.Finder\n"
+              "dylib:/x.dylib:allow\n"
+              "dylib-override:/x.dylib:allow:com.apple\n");
+  assert(g_config.dylib_count == 1 && g_config.dylibs[0].override_count == 2);
+  assert(strcmp(g_config.dylibs[0].overrides[0].pattern, "com.apple.Finder") == 0);
+  assert(g_config.dylibs[0].overrides[0].allow == 0);
+  assert(g_config.dylibs[0].overrides[1].allow == 1);
+  assert(g_config_warning_count == 0);
+
+  /* an override that names no dylib is reported, not dropped in silence */
+  load_config("dylib:/x.dylib:allow\ndylib-override:/y.dylib:deny:com.apple.Finder\n");
+  assert(g_config.dylibs[0].override_count == 0);
+  assert(g_config_warning_count == 1 && warned("line 2: dylib-override for /y.dylib"));
+
+  /* so is everything past a limit */
+  {
+    static char text[MAX_DYLIBS * 24 + (MAX_OVERRIDES + 2) * 40 + 64];
+    char* at = text;
+    for (int i = 0; i < MAX_DYLIBS + 1; i++) at += sprintf(at, "dylib:/d%d.dylib\n", i);
+    for (int i = 0; i < MAX_OVERRIDES + 1; i++) at += sprintf(at, "dylib-override:/d0.dylib:deny:p%d\n", i);
+    load_config(text);
+    assert(g_config.dylib_count == MAX_DYLIBS);
+    assert(g_config.dylibs[0].override_count == MAX_OVERRIDES);
+    assert(g_config_warning_count == 2 && warned("dylib lines") && warned("overrides for /d0.dylib"));
+  }
+  unlink("build/test.conf");
+  g_config = saved;
+  g_config_warning_count = 0;
+}
+
+static void* send_later(void* context) {
+  ExceptionRequest message;
+  usleep(450 * 1000); /* later than the old 300 ms limit */
+  memset(&message, 0, sizeof(message));
+  message.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+  send_to(*(mach_port_t*)context, &message, 76);
+  return NULL;
+}
+
+static double seconds_since(const struct timespec* start) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (double)(now.tv_sec - start->tv_sec) + (double)(now.tv_nsec - start->tv_nsec) / 1e9;
+}
+
+/* The wait lasts as long as the launch may need, but not past the task's end. */
+static void check_wait(void) {
+  ExceptionRequest received;
+  struct timespec start;
+  pthread_t thread;
+  int gone = -1;
+  mach_port_t port = port_with_send();
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  assert(pthread_create(&thread, NULL, send_later, &port) == 0);
+  assert(wait_for_exception(port, mach_task_self(), 5000, &received, &gone) == KERN_SUCCESS);
+  assert(gone == 0 && seconds_since(&start) > 0.4 && seconds_since(&start) < 2.0);
+  mach_msg_destroy(&received.header);
+  pthread_join(thread, NULL);
+
+  /* nothing arrives: the whole time, and the task is still there */
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  assert(wait_for_exception(port, mach_task_self(), 600, &received, &gone) == MACH_RCV_TIMED_OUT);
+  assert(gone == 0 && seconds_since(&start) > 0.55 && seconds_since(&start) < 1.5);
+
+  /* a task that has ended (its port is a dead name): one slice, not five seconds */
+  mach_port_t ended = port_with_send();
+  assert(mach_port_mod_refs(mach_task_self(), ended, MACH_PORT_RIGHT_RECEIVE, -1) == KERN_SUCCESS);
+  assert(task_is_gone(ended) && !task_is_gone(mach_task_self()));
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  assert(wait_for_exception(port, ended, 5000, &received, &gone) == MACH_RCV_TIMED_OUT);
+  assert(gone == 1 && seconds_since(&start) < 1.0);
+  mach_port_deallocate(mach_task_self(), ended);
+  release_exception_port(port);
+}
+
 /* A path that doesn't fit is left out whole, never cut. */
 static void check_value_capacity(void) {
   char small[sizeof("DYLD_INSERT_LIBRARIES=dynjectd.c") + 5];
@@ -431,6 +557,9 @@ int main(void) {
   check_value_capacity();
   check_bundle_identifier();
   check_verified_policy();
+  check_daemon_names();
+  check_config();
+  check_wait();
   check_exec_identity();
   check_copy_printable();
   check_forged_exception();
