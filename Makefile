@@ -5,7 +5,7 @@ LAUNCH_DAEMONS = /Library/LaunchDaemons
 BINARY_DAEMON = $(BUILD_DIR)/dynjectd
 BINARY_LOADER = $(BUILD_DIR)/dynject_loader
 SOURCE_DAEMON = dynjectd.c
-SOURCE_LOADER = dynject_loader.c
+SOURCE_LOADER = dynject_loader.c amfid_stub.s
 ENTITLEMENTS  = dynjectd.entitlements
 PLIST         = com.dynject.dynjectd.plist
 
@@ -19,12 +19,20 @@ CFLAGS = \
 	-fblocks \
 	-isysroot "$(SDK)"
 
-CFLAGS_DAEMON = $(CFLAGS) -lEndpointSecurity -lbsm
+CFLAGS_DAEMON = $(CFLAGS) -lEndpointSecurity -lbsm -framework CoreFoundation
 CFLAGS_LOADER = $(CFLAGS) -lobjc
 
-.PHONY: all clean install uninstall load unload
+.PHONY: all clean install uninstall load unload test
 
 all: $(BINARY_DAEMON) $(BINARY_LOADER)
+
+test: | $(BUILD_DIR)
+	$(CC) $(CFLAGS_DAEMON) -o $(BUILD_DIR)/test_daemon_policy tests/test_daemon_policy.c log.c
+	$(BUILD_DIR)/test_daemon_policy
+	$(CC) $(CFLAGS_LOADER) -o $(BUILD_DIR)/test_amfid_stub tests/test_amfid_stub.c amfid_stub.s log.c
+	$(BUILD_DIR)/test_amfid_stub
+	$(CC) $(CFLAGS_LOADER) -o $(BUILD_DIR)/test_loader_stop tests/test_loader_stop.c amfid_stub.s log.c
+	$(BUILD_DIR)/test_loader_stop
 
 $(BUILD_DIR):
 	@mkdir -p $@
@@ -65,6 +73,7 @@ load:
 
 unload:
 	-launchctl unload $(LAUNCH_DAEMONS)/$(PLIST) 2>/dev/null
+	-pkill -x dynjectd 2>/dev/null
 	@echo "[-] dynjectd unloaded"
 
 uninstall: unload
