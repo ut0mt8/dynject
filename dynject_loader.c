@@ -10,11 +10,13 @@
 #include <mach/mach_vm.h>
 #include <objc/runtime.h>
 #include <ptrauth.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/proc.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -180,6 +182,70 @@ static pid_t find_amfid_pid(void) {
 
   free(pid_list);
   return result;
+}
+
+/* Running processes with this name and owner, other than the caller. */
+static int find_processes(const char* name, uid_t uid, pid_t* out, int max) {
+  int pid_count;
+  pid_t* pid_list;
+  int found_count;
+  int count = 0;
+  int i;
+
+  pid_count = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0) / (int)sizeof(pid_t);
+  if (pid_count <= 0) return 0;
+  pid_list = calloc((size_t)pid_count, sizeof(pid_t));
+  if (pid_list == NULL) return 0;
+  found_count = proc_listpids(PROC_ALL_PIDS, 0, pid_list,
+                              pid_count * (int)sizeof(pid_t)) /
+                (int)sizeof(pid_t);
+
+  for (i = 0; i < found_count && count < max; i++) {
+    struct proc_bsdshortinfo info;
+
+    if (pid_list[i] <= 0 || pid_list[i] == getpid()) continue;
+    if (proc_pidinfo(pid_list[i], PROC_PIDT_SHORTBSDINFO, 0, &info,
+                     sizeof(info)) != (int)sizeof(info)) {
+      continue;
+    }
+    /* the kernel keeps only the first characters of a long name */
+    if (info.pbsi_uid == uid &&
+        strncmp(info.pbsi_comm, name, sizeof(info.pbsi_comm) - 1) == 0 &&
+        info.pbsi_status != SZOMB) {
+      out[count++] = pid_list[i];
+    }
+  }
+
+  free(pid_list);
+  return count;
+}
+
+/* Ends every running process with this name and owner: SIGTERM, then
+ * SIGKILL for whatever is left after grace_ms. The job can be started again
+ * while a daemon from an earlier start is still running (it is in its own
+ * process group and outlives the loader); two daemons would both intercept
+ * every launch. Returns how many were found. */
+static int stop_processes(const char* name, uid_t uid, int grace_ms) {
+  pid_t pids[64];
+  int found;
+  int waited_ms;
+  int i;
+
+  found = find_processes(name, uid, pids, 64);
+  if (found == 0) return 0;
+
+  for (i = 0; i < found; i++) kill(pids[i], SIGTERM);
+  for (waited_ms = 0; waited_ms < grace_ms; waited_ms += 20) {
+    usleep(20 * 1000);
+    if (find_processes(name, uid, pids, 64) == 0) return found;
+  }
+  i = find_processes(name, uid, pids, 64);
+  while (i-- > 0) kill(pids[i], SIGKILL);
+  for (waited_ms = 0; waited_ms < 2000; waited_ms += 20) {
+    usleep(20 * 1000);
+    if (find_processes(name, uid, pids, 64) == 0) break;
+  }
+  return found;
 }
 
 static mach_vm_address_t find_validate_imp(void) {
@@ -425,6 +491,7 @@ int main(int argc, char* argv[]) {
   kern_return_t kr;
   int i;
   int used;
+  int stopped;
   int child_status;
 
   const char* log_path = DEFAULT_LOGFILE;
@@ -464,6 +531,17 @@ int main(int argc, char* argv[]) {
   log_init("dynject_loader", log_path, g_verbose);
 
   LOG("dynject_loader");
+
+  /* one daemon at a time */
+  {
+    const char* daemon_name = strrchr(dynjectd_path, '/');
+    daemon_name = daemon_name != NULL ? daemon_name + 1 : dynjectd_path;
+    stopped = stop_processes(daemon_name, 0, 3000);
+    if (stopped > 0) {
+      LOG("stopped %d running %s before starting a new one", stopped,
+          daemon_name);
+    }
+  }
 
   /* find amfid */
   amfid_pid = find_amfid_pid();

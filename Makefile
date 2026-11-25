@@ -31,6 +31,8 @@ test: | $(BUILD_DIR)
 	$(BUILD_DIR)/test_daemon_policy
 	$(CC) $(CFLAGS_LOADER) -o $(BUILD_DIR)/test_amfid_stub tests/test_amfid_stub.c amfid_stub.s log.c
 	$(BUILD_DIR)/test_amfid_stub
+	$(CC) $(CFLAGS_LOADER) -o $(BUILD_DIR)/test_loader_stop tests/test_loader_stop.c amfid_stub.s log.c
+	$(BUILD_DIR)/test_loader_stop
 
 $(BUILD_DIR):
 	@mkdir -p $@
@@ -71,6 +73,7 @@ load:
 
 unload:
 	-launchctl unload $(LAUNCH_DAEMONS)/$(PLIST) 2>/dev/null
+	-pkill -x dynjectd 2>/dev/null
 	@echo "[-] dynjectd unloaded"
 
 uninstall: unload
