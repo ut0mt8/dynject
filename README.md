@@ -65,6 +65,13 @@ sudo make load
 # bundle_pattern is matched as a substring against the XPC service bundle ID.
 # First matching override wins; falls back to the dylib's default policy.
 #
+# The service label is chosen by whoever starts the job, so for a program in
+# an app bundle the same rule is also applied to "application.<id>.", where
+# <id> is the CFBundleIdentifier in the app's own Info.plist (compared without
+# regard to case). A dylib is injected only if both say so: an allow override
+# has to match the app's identifier too, and a deny override applies if it
+# matches either.
+#
 # Examples:
 #
 #   Inject everywhere:

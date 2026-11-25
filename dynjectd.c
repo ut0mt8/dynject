@@ -3,11 +3,13 @@
  *
  */
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <EndpointSecurity/EndpointSecurity.h>
 #include <bsm/libbsm.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <mach/arm/thread_state.h>
 #include <mach/exception_types.h>
@@ -20,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -296,24 +299,142 @@ static int find_intercept_addresses(void) {
   return 0;
 }
 
-static const char* build_dyld_for_bundle(const char* bundle_id, char* out_buf,
+#define INFO_PLIST_MAX (1024 * 1024)
+
+/* CFBundleIdentifier from one Info.plist. The file is opened without
+ * following a symlink and read with a size limit. */
+static int read_info_plist_identifier(const char* plist_path, char* out,
+                                      size_t out_size) {
+  struct stat st;
+  uint8_t* bytes = NULL;
+  CFDataRef data = NULL;
+  CFPropertyListRef plist = NULL;
+  ssize_t got = 0;
+  size_t total = 0;
+  int found = 0;
+  int fd;
+
+  fd = open(plist_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return 0;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+      st.st_size > INFO_PLIST_MAX) {
+    close(fd);
+    return 0;
+  }
+  bytes = malloc((size_t)st.st_size);
+  while (bytes != NULL && total < (size_t)st.st_size &&
+         (got = read(fd, bytes + total, (size_t)st.st_size - total)) > 0) {
+    total += (size_t)got;
+  }
+  close(fd);
+  if (bytes == NULL || total != (size_t)st.st_size) {
+    free(bytes);
+    return 0;
+  }
+
+  data = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, bytes,
+                                     (CFIndex)total, kCFAllocatorNull);
+  if (data != NULL) {
+    plist = CFPropertyListCreateWithData(kCFAllocatorDefault, data,
+                                         kCFPropertyListImmutable, NULL, NULL);
+  }
+  if (plist != NULL && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+    CFTypeRef value =
+        CFDictionaryGetValue((CFDictionaryRef)plist, CFSTR("CFBundleIdentifier"));
+    if (value != NULL && CFGetTypeID(value) == CFStringGetTypeID() &&
+        CFStringGetCString((CFStringRef)value, out, (CFIndex)out_size,
+                           kCFStringEncodingASCII) &&
+        out[0] != '\0') {
+      found = 1;
+    }
+  }
+  if (plist != NULL) CFRelease(plist);
+  if (data != NULL) CFRelease(data);
+  free(bytes);
+  if (!found && out_size > 0) out[0] = '\0';
+  return found;
+}
+
+/* The bundle identifier of the app an executable belongs to: the innermost
+ * ".app" directory in its resolved path. Returns 1 with the identifier, 0
+ * when the path is not inside an app bundle, and -1 (identifier empty) when
+ * it is but no identifier could be read. */
+static int bundle_identifier_for_executable(const char* executable_path,
+                                            char* out, size_t out_size) {
+  char resolved[PATH_MAX];
+  char plist_path[PATH_MAX];
+  const char* path = executable_path;
+  const char* scan;
+  const char* last = NULL;
+  size_t bundle_len;
+
+  if (out_size > 0) out[0] = '\0';
+  if (realpath(executable_path, resolved) != NULL) path = resolved;
+
+  for (scan = path; (scan = strstr(scan, ".app/")) != NULL; scan += 5) {
+    last = scan;
+  }
+  if (last == NULL) return 0;
+  bundle_len = (size_t)(last - path) + 4;
+
+  if (snprintf(plist_path, sizeof(plist_path), "%.*s/Contents/Info.plist",
+               (int)bundle_len, path) < (int)sizeof(plist_path) &&
+      read_info_plist_identifier(plist_path, out, out_size)) {
+    return 1;
+  }
+  if (snprintf(plist_path, sizeof(plist_path), "%.*s/Info.plist",
+               (int)bundle_len, path) < (int)sizeof(plist_path) &&
+      read_info_plist_identifier(plist_path, out, out_size)) {
+    return 1;
+  }
+  return -1;
+}
+
+/* A dylib's policy for one subject: the first override whose pattern is in
+ * it wins, else the dylib's default. */
+static int dylib_policy_for(int i, const char* subject, int ignore_case,
+                            const char** reason) {
+  int j;
+
+  for (j = 0; j < g_config.dylibs[i].override_count; j++) {
+    const char* pattern = g_config.dylibs[i].overrides[j].pattern;
+    if ((ignore_case ? strcasestr(subject, pattern) : strstr(subject, pattern)) !=
+        NULL) {
+      *reason = g_config.dylibs[i].overrides[j].allow ? "override allow"
+                                                      : "override deny";
+      return g_config.dylibs[i].overrides[j].allow;
+    }
+  }
+  *reason = g_config.dylibs[i].default_allow ? "default allow" : "default deny";
+  return g_config.dylibs[i].default_allow;
+}
+
+/* `bundle_id` is the launchd label, which whoever submits the job chooses.
+ * `verified` is "application.<bundle identifier>." built from the launched
+ * app's own Info.plist, or NULL when the program is not in an app bundle. A
+ * dylib is injected only if its policy says so for both, so a made-up label
+ * can neither pull a dylib into an app it isn't meant for nor dodge a deny. */
+static const char* build_dyld_for_bundle(const char* bundle_id,
+                                         const char* verified, char* out_buf,
                                          size_t out_size) {
   int i;
-  int j;
   int first;
 
   strlcpy(out_buf, "DYLD_INSERT_LIBRARIES=", out_size);
   first = 1;
 
   for (i = 0; i < g_config.dylib_count; i++) {
-    int should_inject = g_config.dylibs[i].default_allow;
-    const char* reason = should_inject ? "default allow" : "default deny";
+    const char* reason = "";
+    int should_inject = dylib_policy_for(i, bundle_id, 0, &reason);
 
-    for (j = 0; j < g_config.dylibs[i].override_count; j++) {
-      if (strstr(bundle_id, g_config.dylibs[i].overrides[j].pattern) != NULL) {
-        should_inject = g_config.dylibs[i].overrides[j].allow;
-        reason = should_inject ? "override allow" : "override deny";
-        break;
+    if (should_inject && verified != NULL) {
+      const char* verified_reason = "";
+      if (!dylib_policy_for(i, verified, 1, &verified_reason)) {
+        LOG("SKIP dylib[%d] %s: the label %s says inject, the app's own "
+            "identifier (%s) says %s",
+            i, g_config.dylibs[i].path, bundle_id, verified, verified_reason);
+        should_inject = 0;
+        reason = "label and app identifier disagree";
       }
     }
 
@@ -777,7 +898,19 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
   VLOG("policy pid=%d evaluating dylib policies for bundle: %s",
        (int)xpcproxy_pid, service_name);
 
-  build_dyld_for_bundle(service_name, dyld_value, sizeof(dyld_value));
+  {
+    char identifier[200];
+    char verified[256];
+    int in_bundle = bundle_identifier_for_executable(app_path, identifier,
+                                                     sizeof(identifier));
+    if (in_bundle != 0) {
+      /* In a bundle without a readable identifier: no allow override can
+       * match, deny overrides and defaults still apply. */
+      snprintf(verified, sizeof(verified), "application.%s.", identifier);
+    }
+    build_dyld_for_bundle(service_name, in_bundle != 0 ? verified : NULL,
+                          dyld_value, sizeof(dyld_value));
+  }
 
   if (dyld_value[strlen("DYLD_INSERT_LIBRARIES=")] == '\0') {
     LOG("%s SKIP (no dylibs allowed for this bundle)", service_name);

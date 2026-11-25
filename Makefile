@@ -19,7 +19,7 @@ CFLAGS = \
 	-fblocks \
 	-isysroot "$(SDK)"
 
-CFLAGS_DAEMON = $(CFLAGS) -lEndpointSecurity -lbsm
+CFLAGS_DAEMON = $(CFLAGS) -lEndpointSecurity -lbsm -framework CoreFoundation
 CFLAGS_LOADER = $(CFLAGS) -lobjc
 
 .PHONY: all clean install uninstall load unload test

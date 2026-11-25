@@ -14,7 +14,7 @@ static void* run_policy(void* context) {
   Worker* worker = (Worker*)context;
   for (int i = 0; i < 10000; i++) {
     char value[4096];
-    assert(build_dyld_for_bundle(worker->service, value, sizeof(value)));
+    assert(build_dyld_for_bundle(worker->service, NULL, value, sizeof(value)));
     assert(strcmp(value, worker->expected) == 0);
   }
   return NULL;
@@ -305,10 +305,100 @@ static void check_kernel_exception(void) {
    * the kernel, with its message's rights held, until the test exits. */
 }
 
+static void write_file(const char* path, const char* text) {
+  FILE* file = fopen(path, "w");
+  assert(file != NULL);
+  fputs(text, file);
+  fclose(file);
+}
+
+static void write_info_plist(const char* path, const char* identifier) {
+  char text[512];
+  snprintf(text, sizeof(text),
+           "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>"
+           "<key>CFBundleIdentifier</key><string>%s</string></dict></plist>\n",
+           identifier);
+  write_file(path, text);
+}
+
+/* The identifier comes from the innermost app bundle around the executable. */
+static void check_bundle_identifier(void) {
+  char id[200];
+  const char* root = "build/idtest";
+  assert(system("rm -rf build/idtest && mkdir -p"
+                " build/idtest/Outer.app/Contents/MacOS"
+                " build/idtest/Outer.app/Contents/Helpers/Inner.app/Contents/MacOS"
+                " build/idtest/Flat.app build/idtest/NoId.app/Contents/MacOS"
+                " build/idtest/Linked.app/Contents/MacOS") == 0);
+  (void)root;
+  write_info_plist("build/idtest/Outer.app/Contents/Info.plist", "com.example.Outer");
+  write_file("build/idtest/Outer.app/Contents/MacOS/Outer", "x");
+  write_info_plist("build/idtest/Outer.app/Contents/Helpers/Inner.app/Contents/Info.plist",
+                   "com.example.inner");
+  write_file("build/idtest/Outer.app/Contents/Helpers/Inner.app/Contents/MacOS/Inner", "x");
+  write_info_plist("build/idtest/Flat.app/Info.plist", "com.example.flat");
+  write_file("build/idtest/Flat.app/Flat", "x");
+  write_file("build/idtest/NoId.app/Contents/MacOS/NoId", "x");
+  write_file("build/idtest/Linked.app/Contents/MacOS/Linked", "x");
+  write_file("build/idtest/plain", "x");
+  assert(symlink("Outer.app/Contents/MacOS/Outer", "build/idtest/Calculator") == 0);
+  assert(symlink("../../Outer.app/Contents/Info.plist",
+                 "build/idtest/Linked.app/Contents/Info.plist") == 0);
+
+  assert(bundle_identifier_for_executable("build/idtest/Outer.app/Contents/MacOS/Outer", id, sizeof(id)) == 1);
+  assert(strcmp(id, "com.example.Outer") == 0);
+  assert(bundle_identifier_for_executable(
+             "build/idtest/Outer.app/Contents/Helpers/Inner.app/Contents/MacOS/Inner", id, sizeof(id)) == 1);
+  assert(strcmp(id, "com.example.inner") == 0);
+  assert(bundle_identifier_for_executable("build/idtest/Flat.app/Flat", id, sizeof(id)) == 1);
+  assert(strcmp(id, "com.example.flat") == 0);
+  /* a symlink elsewhere to an app's executable is still that app */
+  assert(bundle_identifier_for_executable("build/idtest/Calculator", id, sizeof(id)) == 1);
+  assert(strcmp(id, "com.example.Outer") == 0);
+  /* in a bundle, no identifier to read: -1, never another bundle's */
+  assert(bundle_identifier_for_executable("build/idtest/NoId.app/Contents/MacOS/NoId", id, sizeof(id)) == -1);
+  assert(id[0] == '\0');
+  assert(bundle_identifier_for_executable("build/idtest/Linked.app/Contents/MacOS/Linked", id, sizeof(id)) == -1);
+  assert(bundle_identifier_for_executable("build/idtest/plain", id, sizeof(id)) == 0);
+  assert(bundle_identifier_for_executable("build/idtest/missing", id, sizeof(id)) == 0);
+  assert(system("rm -rf build/idtest") == 0);
+}
+
+/* dylib 0 is allowed by default; dylib 1 only where "second" matches. A label
+ * alone doesn't decide: the app's own identifier has to agree. */
+static void check_verified_policy(void) {
+  char value[4096];
+  const char* only_first = "DYLD_INSERT_LIBRARIES=dynjectd.c";
+  const char* both = "DYLD_INSERT_LIBRARIES=dynjectd.c:dynject_loader.c";
+
+  /* a label made up to contain the pattern, around another app */
+  assert(build_dyld_for_bundle("x.second.com.victim.app", "application.com.victim.app.", value, sizeof(value)));
+  assert(strcmp(value, only_first) == 0);
+  /* label and identifier agree; the identifier's case doesn't matter */
+  assert(build_dyld_for_bundle("application.second.1.2", "application.SECOND.", value, sizeof(value)));
+  assert(strcmp(value, both) == 0);
+  /* not in a bundle: the label decides, as before */
+  assert(build_dyld_for_bundle("homebrew.second", NULL, value, sizeof(value)));
+  assert(strcmp(value, both) == 0);
+  /* in a bundle with no identifier: defaults only */
+  assert(build_dyld_for_bundle("application.second.1.2", "application..", value, sizeof(value)));
+  assert(strcmp(value, only_first) == 0);
+
+  /* a deny can't be dodged by leaving its pattern out of the label */
+  strlcpy(g_config.dylibs[0].overrides[0].pattern, "com.victim", 256);
+  g_config.dylibs[0].overrides[0].allow = 0;
+  g_config.dylibs[0].override_count = 1;
+  assert(build_dyld_for_bundle("anything", "application.com.victim.app.", value, sizeof(value)) == NULL);
+  assert(build_dyld_for_bundle("application.com.victim.app.1.2", "application.com.victim.app.", value, sizeof(value)) == NULL);
+  assert(build_dyld_for_bundle("application.other.1.2", "application.other.", value, sizeof(value)));
+  assert(strcmp(value, only_first) == 0);
+  g_config.dylibs[0].override_count = 0;
+}
+
 /* A path that doesn't fit is left out whole, never cut. */
 static void check_value_capacity(void) {
   char small[sizeof("DYLD_INSERT_LIBRARIES=dynjectd.c") + 5];
-  assert(build_dyld_for_bundle("second", small, sizeof(small)));
+  assert(build_dyld_for_bundle("second", NULL, small, sizeof(small)));
   assert(strcmp(small, "DYLD_INSERT_LIBRARIES=dynjectd.c") == 0);
 }
 
@@ -339,6 +429,8 @@ int main(void) {
   check_envp_dyld_at_page_end();
   check_envp_unreadable();
   check_value_capacity();
+  check_bundle_identifier();
+  check_verified_policy();
   check_exec_identity();
   check_copy_printable();
   check_forged_exception();
