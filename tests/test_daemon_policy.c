@@ -158,6 +158,153 @@ static void check_envp_unreadable(void) {
                              "DYLD_INSERT_LIBRARIES=/a.dylib") == 0);
 }
 
+static mach_port_urefs_t send_refs(mach_port_t name) {
+  mach_port_urefs_t refs = 0;
+  mach_port_get_refs(mach_task_self(), name, MACH_PORT_RIGHT_SEND, &refs);
+  return refs;
+}
+
+static mach_port_t port_with_send(void) {
+  mach_port_t port;
+  assert(make_exception_port(&port) == KERN_SUCCESS);
+  return port;
+}
+
+static void send_to(mach_port_t port, ExceptionRequest* message, mach_msg_size_t size) {
+  message->header.msgh_remote_port = port;
+  message->header.msgh_size = size;
+  assert(mach_msg(&message->header, MACH_SEND_MSG, size, 0, MACH_PORT_NULL, 0,
+                  MACH_PORT_NULL) == KERN_SUCCESS);
+}
+
+/* Only /usr/libexec/xpcproxy as a platform binary is intercepted. */
+static void check_exec_identity(void) {
+  const char* real = "/usr/libexec/xpcproxy";
+  const char* fake = "/tmp/xpcproxy";
+  const char* longer = "/usr/libexec/xpcproxy2";
+  assert(exec_target_is_xpcproxy(real, strlen(real), 1));
+  assert(!exec_target_is_xpcproxy(real, strlen(real), 0));
+  assert(!exec_target_is_xpcproxy(fake, strlen(fake), 1));
+  assert(!exec_target_is_xpcproxy(longer, strlen(longer), 1));
+  assert(!exec_target_is_xpcproxy(real, strlen(real) - 1, 1));
+  assert(!exec_target_is_xpcproxy(NULL, 0, 1));
+}
+
+static void check_copy_printable(void) {
+  char out[16];
+  const char* label = "a\nb\rc\x1b\x7f" "d\xc3\xa9";
+  copy_printable(out, sizeof(out), label, strlen(label), 1);
+  assert(strcmp(out, "a?b?c??d??") == 0);
+  copy_printable(out, sizeof(out), label, strlen(label), 0);
+  assert(strcmp(out, "a?b?c??d\xc3\xa9") == 0);
+  copy_printable(out, 4, "abcdef", 6, 1); /* cut to fit, terminated */
+  assert(strcmp(out, "abc") == 0);
+  copy_printable(out, sizeof(out), "abcdef", 2, 1); /* a token has a length, no NUL */
+  assert(strcmp(out, "ab") == 0);
+  copy_printable(out, sizeof(out), NULL, 5, 1);
+  assert(out[0] == '\0');
+}
+
+/* A process can send to its own exception port. Messages that aren't the
+ * kernel's are rejected, whatever their shape, and the names in them are
+ * never released. */
+static void check_forged_exception(void) {
+  mach_port_t victim_a = port_with_send(), victim_b = port_with_send();
+  ExceptionRequest forged, received;
+
+  /* 1. plain data: the "port names" are just integers the sender chose */
+  mach_port_t port = port_with_send();
+  memset(&forged, 0, sizeof(forged));
+  forged.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+  forged.header.msgh_id = MACH_EXCEPTION_RAISE_ID;
+  forged.thread_port.name = victim_a;
+  forged.task_port.name = victim_b;
+  forged.exception_type = EXC_BREAKPOINT;
+  forged.code_count = 2;
+  send_to(port, &forged, (mach_msg_size_t)offsetof(ExceptionRequest, padding));
+  assert(receive_exception(port, 1000, &received) == KERN_SUCCESS);
+  assert(received.thread_port.name == victim_a);
+  assert(!exception_request_valid(&received));
+  mach_msg_destroy(&received.header);
+  release_exception_port(port);
+
+  /* 2. the same shape as the kernel's message, with real rights, sent by us */
+  port = port_with_send();
+  memset(&forged, 0, sizeof(forged));
+  forged.header.msgh_bits =
+      MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+  forged.header.msgh_id = MACH_EXCEPTION_RAISE_ID;
+  forged.body.msgh_descriptor_count = 2;
+  forged.thread_port.name = victim_a;
+  forged.thread_port.disposition = MACH_MSG_TYPE_COPY_SEND;
+  forged.thread_port.type = MACH_MSG_PORT_DESCRIPTOR;
+  forged.task_port = forged.thread_port;
+  forged.task_port.name = victim_b;
+  forged.ndr = NDR_record;
+  forged.exception_type = EXC_BREAKPOINT;
+  forged.code_count = 2;
+  send_to(port, &forged, (mach_msg_size_t)offsetof(ExceptionRequest, padding));
+  assert(receive_exception(port, 1000, &received) == KERN_SUCCESS);
+  assert(received.header.msgh_bits & MACH_MSGH_BITS_COMPLEX);
+  assert(received.thread_port.disposition == MACH_MSG_TYPE_PORT_SEND);
+  assert(!exception_request_valid(&received)); /* only the sender is wrong */
+  assert(send_refs(victim_a) == 2);
+  mach_msg_destroy(&received.header); /* gives back the rights it carried */
+  assert(send_refs(victim_a) == 1 && send_refs(victim_b) == 1);
+  release_exception_port(port);
+
+  /* 3. through the real handler */
+  port = port_with_send();
+  memset(&forged, 0, sizeof(forged));
+  forged.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+  forged.thread_port.name = victim_a;
+  forged.task_port.name = victim_b;
+  forged.exception_type = EXC_BAD_ACCESS;
+  send_to(port, &forged, 76);
+  XpcHandlerArgs* args = calloc(1, sizeof(*args));
+  assert(args != NULL);
+  assert(mach_port_mod_refs(mach_task_self(), mach_task_self(), MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS);
+  args->pid = getpid();
+  args->task = mach_task_self(); /* the handler releases one reference */
+  args->exception_port = port;
+  strlcpy(args->service_name, "application.test", sizeof(args->service_name));
+  xpc_handler_thread(args);
+  assert(send_refs(victim_a) == 1 && send_refs(victim_b) == 1);
+
+  release_exception_port(victim_a);
+  release_exception_port(victim_b);
+}
+
+/* The kernel's own breakpoint message is accepted. */
+static mach_port_t g_trap_port;
+
+static void* trap_thread(void* context) {
+  (void)context;
+  assert(thread_set_exception_ports(mach_thread_self(), EXC_MASK_BREAKPOINT, g_trap_port,
+                                    EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+                                    ARM_THREAD_STATE64) == KERN_SUCCESS);
+  __builtin_debugtrap();
+  return NULL;
+}
+
+static void check_kernel_exception(void) {
+  pthread_t thread;
+  pthread_attr_t attr;
+  ExceptionRequest received;
+
+  g_trap_port = port_with_send();
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  assert(pthread_create(&thread, &attr, trap_thread, NULL) == 0);
+  pthread_attr_destroy(&attr);
+
+  assert(receive_exception(g_trap_port, 5000, &received) == KERN_SUCCESS);
+  assert(exception_request_valid(&received));
+  assert(received.exception_type == EXC_BREAKPOINT);
+  /* No reply: the thread can't continue past the trap, so it stays parked in
+   * the kernel, with its message's rights held, until the test exits. */
+}
+
 /* A path that doesn't fit is left out whole, never cut. */
 static void check_value_capacity(void) {
   char small[sizeof("DYLD_INSERT_LIBRARIES=dynjectd.c") + 5];
@@ -192,6 +339,10 @@ int main(void) {
   check_envp_dyld_at_page_end();
   check_envp_unreadable();
   check_value_capacity();
+  check_exec_identity();
+  check_copy_printable();
+  check_forged_exception();
+  check_kernel_exception();
 
   Worker workers[] = {
       {"first", "DYLD_INSERT_LIBRARIES=dynjectd.c"},

@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <ptrauth.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -662,9 +663,69 @@ static kern_return_t receive_exception(mach_port_t port, int timeout_ms,
   out_request->header.msgh_local_port = port;
   out_request->header.msgh_size = sizeof(*out_request);
 
-  return mach_msg(&out_request->header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
-                  sizeof(*out_request), port, (mach_msg_timeout_t)timeout_ms,
-                  MACH_PORT_NULL);
+  return mach_msg(&out_request->header,
+                  MACH_RCV_MSG | MACH_RCV_TIMEOUT |
+                      MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+                      MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
+                  0, sizeof(*out_request), port,
+                  (mach_msg_timeout_t)timeout_ms, MACH_PORT_NULL);
+}
+
+#define MACH_EXCEPTION_RAISE_ID 2405
+
+/* The target can read its own exception port (task_get_exception_ports) and
+ * send anything to it, so a received message is only used if it is a
+ * mach_exception_raise that the kernel sent: the right shape, and a sender
+ * audit token with pid 0, which no user process has. Anything else must be
+ * dropped with mach_msg_destroy and none of its fields used. */
+static int exception_request_valid(const ExceptionRequest* request) {
+  const mach_msg_header_t* header = &request->header;
+  const mach_msg_audit_trailer_t* trailer;
+  size_t fixed_size = offsetof(ExceptionRequest, codes);
+
+  if ((header->msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0 ||
+      header->msgh_id != MACH_EXCEPTION_RAISE_ID ||
+      header->msgh_size < fixed_size) {
+    return 0;
+  }
+  if (request->body.msgh_descriptor_count != 2 ||
+      request->thread_port.type != MACH_MSG_PORT_DESCRIPTOR ||
+      request->task_port.type != MACH_MSG_PORT_DESCRIPTOR ||
+      request->thread_port.disposition != MACH_MSG_TYPE_PORT_SEND ||
+      request->task_port.disposition != MACH_MSG_TYPE_PORT_SEND) {
+    return 0;
+  }
+  if (request->code_count > 2 ||
+      header->msgh_size !=
+          fixed_size + request->code_count * sizeof(request->codes[0])) {
+    return 0;
+  }
+
+  trailer = (const mach_msg_audit_trailer_t*)((const uint8_t*)request +
+                                              round_msg(header->msgh_size));
+  if ((const uint8_t*)trailer + sizeof(*trailer) >
+          (const uint8_t*)request + sizeof(*request) ||
+      trailer->msgh_trailer_size < sizeof(*trailer)) {
+    return 0;
+  }
+  return audit_token_to_pid(trailer->msgh_audit) == 0;
+}
+
+/* Copies text that came from outside (a launchd label, a path read from the
+ * target) for the log, so it can't start a new line. With ascii_only, bytes
+ * above 0x7E become '?' too. */
+static void copy_printable(char* out, size_t out_size, const char* in,
+                           size_t in_len, int ascii_only) {
+  size_t i;
+
+  if (out_size == 0) return;
+  for (i = 0; in != NULL && i < in_len && i < out_size - 1 && in[i] != '\0';
+       i++) {
+    unsigned char c = (unsigned char)in[i];
+    out[i] = (c < 0x20 || c == 0x7F || (ascii_only && c > 0x7E)) ? '?'
+                                                                 : (char)c;
+  }
+  out[i] = '\0';
 }
 
 static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
@@ -674,6 +735,7 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
                                  mach_msg_type_number_t state_count) {
   char app_path[PATH_MAX];
   char dyld_value[4096];
+  char app_log[NAME_MAX + 1];
   const char* app_name;
   MatchResult match_result;
   mach_vm_address_t new_envp_address;
@@ -693,7 +755,8 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
     app_name = app_path;
   }
 
-  VLOG("caught pid=%d posix_spawn(%s)", (int)xpcproxy_pid, app_name);
+  copy_printable(app_log, sizeof(app_log), app_name, strlen(app_name), 0);
+  VLOG("caught pid=%d posix_spawn(%s)", (int)xpcproxy_pid, app_log);
   (void)service_name;
 
   match_result = check_match(app_name, app_path);
@@ -703,7 +766,7 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
     return 0;
   }
 
-  VLOG("match pid=%d %s", (int)xpcproxy_pid, app_name);
+  VLOG("match pid=%d %s", (int)xpcproxy_pid, app_log);
 
   /* x5 points to xpcproxy envp array */
   if (thread_state->__x[5] == 0) {
@@ -738,7 +801,7 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
     return -1;
   }
 
-  LOG("%s(%s) MATCH (%d dylib(s) injected)", service_name, app_name,
+  LOG("%s(%s) MATCH (%d dylib(s) injected)", service_name, app_log,
       dylib_count_in_value(dyld_value));
 
   return 1;
@@ -807,6 +870,12 @@ static void* xpc_handler_thread(void* raw_args) {
 
   if (kr != MACH_MSG_SUCCESS) {
     LOG("%s SKIP (mach_msg error: %s)", service_name, mach_error_string(kr));
+    goto cleanup;
+  }
+
+  if (!exception_request_valid(&exc_request)) {
+    LOG("%s SKIP (exception message not from the kernel)", service_name);
+    mach_msg_destroy(&exc_request.header);
     goto cleanup;
   }
 
@@ -1002,10 +1071,21 @@ static int bundle_id_wants_injection(const char* bundle_id, size_t bundle_len) {
   return 0;
 }
 
+#define XPCPROXY_PATH "/usr/libexec/xpcproxy"
+
+/* Only Apple's xpcproxy: a path that merely contains "xpcproxy" lets any
+ * program have itself intercepted. */
+static int exec_target_is_xpcproxy(const char* path, size_t path_len,
+                                   int is_platform_binary) {
+  return is_platform_binary && path != NULL &&
+         path_len == strlen(XPCPROXY_PATH) &&
+         memcmp(path, XPCPROXY_PATH, path_len) == 0;
+}
+
 static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
   const es_process_t* current_process;
   const es_process_t* target_process;
-  const char* target_path;
+  char service_log[256];
   pid_t pid;
   uint32_t arg_count;
   es_string_token_t service_token;
@@ -1023,12 +1103,11 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
     return;
   }
 
-  target_path = (target_process->executable != NULL)
-                    ? target_process->executable->path.data
-                    : "";
-
   /* only intercept xpcproxy */
-  if (strstr(target_path, "xpcproxy") == NULL) {
+  if (target_process->executable == NULL ||
+      !exec_target_is_xpcproxy(target_process->executable->path.data,
+                               target_process->executable->path.length,
+                               target_process->is_platform_binary)) {
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -1042,21 +1121,20 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
   }
 
   service_token = es_exec_arg(&message->event.exec, 1);
-  VLOG("pid=%d %.*s evaluating bundleID", (int)pid, (int)service_token.length,
-       service_token.data);
+  copy_printable(service_log, sizeof(service_log), service_token.data,
+                 service_token.length, 1);
+  VLOG("pid=%d %s evaluating bundleID", (int)pid, service_log);
 
   if (service_token.data != NULL && service_token.length > 0) {
     if (service_name_is_system_daemon(service_token.data,
                                       service_token.length)) {
-      LOG("%.*s SKIP (system_daemon)", (int)service_token.length,
-          service_token.data);
+      LOG("%s SKIP (system_daemon)", service_log);
       es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
       return;
     }
 
     if (!bundle_id_wants_injection(service_token.data, service_token.length)) {
-      VLOG("%.*s SKIP (not UI bundle)", (int)service_token.length,
-           service_token.data);
+      VLOG("%s SKIP (not UI bundle)", service_log);
       es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
       return;
     }
@@ -1090,8 +1168,8 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
                                 EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
                                 ARM_THREAD_STATE64);
   if (kr != KERN_SUCCESS) {
-    LOG("%.*s SKIP (task_set_exception_ports: %s)", (int)service_token.length,
-        service_token.data, mach_error_string(kr));
+    LOG("%s SKIP (task_set_exception_ports: %s)", service_log,
+        mach_error_string(kr));
     mach_port_deallocate(mach_task_self(), task);
     release_exception_port(exc_port);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
@@ -1099,8 +1177,7 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
   }
 
   if (set_hw_bps(task, 1) != 0) {
-    LOG("%.*s SKIP (set_hw_bps failed)", (int)service_token.length,
-        service_token.data);
+    LOG("%s SKIP (set_hw_bps failed)", service_log);
     mach_port_deallocate(mach_task_self(), task);
     release_exception_port(exc_port);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
