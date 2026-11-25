@@ -65,6 +65,13 @@ sudo make load
 # bundle_pattern is matched as a substring against the XPC service bundle ID.
 # First matching override wins; falls back to the dylib's default policy.
 #
+# The service label is chosen by whoever starts the job, so for a program in
+# an app bundle the same rule is also applied to "application.<id>.", where
+# <id> is the CFBundleIdentifier in the app's own Info.plist (compared without
+# regard to case). A dylib is injected only if both say so: an allow override
+# has to match the app's identifier too, and a deny override applies if it
+# matches either.
+#
 # Examples:
 #
 #   Inject everywhere:
@@ -105,12 +112,18 @@ skip_helpers:yes
 
 The LaunchDaemon (`/Library/LaunchDaemons/com.dynject.dynjectd.plist`) runs
 `dynject_loader` which:
-1. Hooks amfid's validation method with a trampoline (real validation runs,
-   return value is forced to YES)
+1. Hooks amfid's validation method with a trampoline (real validation runs;
+   one failed result is turned into YES, once)
 2. Launches dynjectd (whose entitlements are approved by the hook)
-3. Waits for the kernel/amfid round-trip to complete
-4. Restores amfid to its original state
-5. Exits
+3. Removes the hook as soon as the launch returns (the kernel has amfid check
+   the signature during the launch)
+4. Exits
+
+The hook approves a single signature and stops by itself after 300 ms, so it
+ends even if the loader is killed before step 3; the next run then puts
+amfid's original instructions back before hooking again. If another program
+gets its signature approved in that window instead of dynjectd, dynjectd fails
+to start and the loader logs an error.
 
 dynjectd then runs continuously, intercepting app launches.
 
