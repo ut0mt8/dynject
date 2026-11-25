@@ -329,6 +329,15 @@ static const char* build_dyld_for_bundle(const char* bundle_id, char* out_buf,
       continue;
     }
 
+    /* Never hand dyld part of a path. */
+    size_t used = strlen(out_buf);
+    size_t needed = strlen(g_config.dylibs[i].path) + (!first ? 1 : 0);
+    if (needed >= out_size - used) {
+      LOG("SKIP dylib[%d] %s: injection value full", i,
+          g_config.dylibs[i].path);
+      continue;
+    }
+
     if (!first) {
       strlcat(out_buf, ":", out_size);
     }
@@ -357,44 +366,71 @@ static int dylib_count_in_value(const char* dyld_value) {
   return count;
 }
 
-static size_t read_remote_string(task_t task, mach_vm_address_t remote_address,
-                                 char* local_buffer, size_t buffer_size) {
-  mach_vm_size_t bytes_read;
-  kern_return_t kr;
+/* Reads a NUL-terminated string from the target into local_buffer. It reads at
+ * most to the next 4 KiB boundary at a time (every page boundary is one), so a
+ * short string that ends just before an unmapped page still reads. Returns the
+ * length read (local_buffer is always terminated; a string longer than
+ * buffer_size - 1 is cut there), or -1 if a page before the string's end, or
+ * the buffer's end, couldn't be read. */
+static ssize_t read_remote_string(task_t task, mach_vm_address_t remote_address,
+                                  char* local_buffer, size_t buffer_size) {
+  size_t got;
 
-  if (remote_address == 0 || local_buffer == NULL || buffer_size == 0) {
-    return 0;
+  if (local_buffer == NULL || buffer_size == 0) {
+    return -1;
+  }
+  memset(local_buffer, 0, buffer_size);
+  if (remote_address == 0) {
+    return -1;
   }
 
-  memset(local_buffer, 0, buffer_size);
+  got = 0;
+  while (got < buffer_size - 1) {
+    mach_vm_address_t address = remote_address + got;
+    size_t to_boundary = 4096 - (size_t)(address & 4095);
+    size_t want = buffer_size - 1 - got;
+    mach_vm_size_t bytes_read = 0;
+    kern_return_t kr;
 
-  bytes_read = 0;
-  kr = mach_vm_read_overwrite(task, remote_address, buffer_size - 1,
-                              (mach_vm_address_t)local_buffer, &bytes_read);
-  if (kr != KERN_SUCCESS) {
-    return 0;
+    if (want > to_boundary) {
+      want = to_boundary;
+    }
+    kr = mach_vm_read_overwrite(task, address, want,
+                                (mach_vm_address_t)(local_buffer + got),
+                                &bytes_read);
+    if (kr != KERN_SUCCESS || bytes_read != want) {
+      memset(local_buffer, 0, buffer_size);
+      return -1;
+    }
+    if (memchr(local_buffer + got, '\0', want) != NULL) {
+      return (ssize_t)strlen(local_buffer);
+    }
+    got += want;
   }
 
   local_buffer[buffer_size - 1] = '\0';
-  return (size_t)bytes_read;
+  return (ssize_t)(buffer_size - 1);
 }
 
-static uint64_t read_remote_u64(task_t task, mach_vm_address_t remote_address) {
-  uint64_t value;
+/* Returns 0 and the value, or -1 if the target's memory couldn't be read. A
+ * failed read is not the same as a NULL entry. */
+static int read_remote_u64(task_t task, mach_vm_address_t remote_address,
+                           uint64_t* value) {
   mach_vm_size_t bytes_read;
   kern_return_t kr;
 
-  value = 0;
+  *value = 0;
   bytes_read = 0;
 
-  kr = mach_vm_read_overwrite(task, remote_address, sizeof(value),
-                              (mach_vm_address_t)&value, &bytes_read);
+  kr = mach_vm_read_overwrite(task, remote_address, sizeof(*value),
+                              (mach_vm_address_t)value, &bytes_read);
 
-  if (kr != KERN_SUCCESS || bytes_read != sizeof(value)) {
-    return 0;
+  if (kr != KERN_SUCCESS || bytes_read != sizeof(*value)) {
+    *value = 0;
+    return -1;
   }
 
-  return value;
+  return 0;
 }
 
 static size_t envp_pointer_count(int existing_count, int has_dyld,
@@ -438,7 +474,10 @@ static mach_vm_address_t make_envp_with_dyld(
     mach_vm_address_t entry_value;
 
     probe_address = original_envp_address + (mach_vm_address_t)(i * 8);
-    entry_value = read_remote_u64(task, probe_address);
+    if (read_remote_u64(task, probe_address, &entry_value) != 0) {
+      LOG("SKIP envp: entry %d unreadable", i);
+      return 0;
+    }
 
     if (entry_value == 0) {
       break;
@@ -446,7 +485,11 @@ static mach_vm_address_t make_envp_with_dyld(
 
     existing_ptrs[existing_count] = entry_value;
 
-    read_remote_string(task, entry_value, preview, sizeof(preview));
+    /* Unreadable, we can't tell whether it's an existing DYLD entry. */
+    if (read_remote_string(task, entry_value, preview, sizeof(preview)) < 0) {
+      LOG("SKIP envp: string %d unreadable", i);
+      return 0;
+    }
     if (strncmp(preview, "DYLD_INSERT_LIBRARIES=", 22) == 0) {
       dyld_entry_index = existing_count;
     }
@@ -455,10 +498,14 @@ static mach_vm_address_t make_envp_with_dyld(
   }
 
   /* Do not silently drop the remainder of an unusually large environment. */
-  if (i == 511 &&
-      read_remote_u64(task, original_envp_address + (mach_vm_address_t)(i * 8)) != 0) {
-    LOG("SKIP envp: too many entries");
-    return 0;
+  if (i == 511) {
+    uint64_t next;
+    if (read_remote_u64(task, original_envp_address + (mach_vm_address_t)(i * 8),
+                        &next) != 0 ||
+        next != 0) {
+      LOG("SKIP envp: too many entries");
+      return 0;
+    }
   }
 
   dyld_string_len = strlen(dyld_value) + 1;
@@ -633,8 +680,11 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
   kern_return_t kr;
 
   /* x1 contains the path of the binary xpcproxy is about to spawn */
-  memset(app_path, 0, sizeof(app_path));
-  read_remote_string(task, thread_state->__x[1], app_path, sizeof(app_path));
+  if (read_remote_string(task, thread_state->__x[1], app_path,
+                         sizeof(app_path)) <= 0) {
+    LOG("%s SKIP (spawn path unreadable)", service_name);
+    return 0;
+  }
 
   app_name = strrchr(app_path, '/');
   if (app_name != NULL) {
@@ -700,6 +750,31 @@ typedef struct {
   mach_port_t exception_port;
   char service_name[256];
 } XpcHandlerArgs;
+
+/* A receive right with one send right under the same name, which
+ * task_set_exception_ports copies into the target. */
+static kern_return_t make_exception_port(mach_port_t* port) {
+  kern_return_t kr;
+
+  *port = MACH_PORT_NULL;
+  kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, port);
+  if (kr != KERN_SUCCESS) {
+    return kr;
+  }
+  kr = mach_port_insert_right(mach_task_self(), *port, *port,
+                              MACH_MSG_TYPE_MAKE_SEND);
+  if (kr != KERN_SUCCESS) {
+    mach_port_mod_refs(mach_task_self(), *port, MACH_PORT_RIGHT_RECEIVE, -1);
+    *port = MACH_PORT_NULL;
+  }
+  return kr;
+}
+
+/* Drops both rights. Dropping only the receive right leaves the send right
+ * behind as a dead name, one per intercepted launch. */
+static void release_exception_port(mach_port_t port) {
+  mach_port_destruct(mach_task_self(), port, -1, 0);
+}
 
 static void* xpc_handler_thread(void* raw_args) {
   XpcHandlerArgs* args;
@@ -784,7 +859,7 @@ static void* xpc_handler_thread(void* raw_args) {
 cleanup:
   set_hw_bps(task, 0);
   mach_port_deallocate(mach_task_self(), task);
-  mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+  release_exception_port(exc_port);
   return NULL;
 }
 
@@ -1003,20 +1078,10 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
 
   exc_port = MACH_PORT_NULL;
 
-  kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exc_port);
+  kr = make_exception_port(&exc_port);
   if (kr != KERN_SUCCESS) {
-    LOG("ERROR mach_port_allocate: %s", mach_error_string(kr));
+    LOG("ERROR exception port: %s", mach_error_string(kr));
     mach_port_deallocate(mach_task_self(), task);
-    es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
-    return;
-  }
-
-  kr = mach_port_insert_right(mach_task_self(), exc_port, exc_port,
-                              MACH_MSG_TYPE_MAKE_SEND);
-  if (kr != KERN_SUCCESS) {
-    LOG("ERROR mach_port_insert_right: %s", mach_error_string(kr));
-    mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -1028,7 +1093,7 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
     LOG("%.*s SKIP (task_set_exception_ports: %s)", (int)service_token.length,
         service_token.data, mach_error_string(kr));
     mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    release_exception_port(exc_port);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -1037,7 +1102,7 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
     LOG("%.*s SKIP (set_hw_bps failed)", (int)service_token.length,
         service_token.data);
     mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    release_exception_port(exc_port);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -1048,7 +1113,7 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
                         service_token.length) != 0) {
     set_hw_bps(task, 0);
     mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    release_exception_port(exc_port);
   }
 
   es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);

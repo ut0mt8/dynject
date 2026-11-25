@@ -3,6 +3,7 @@
 #undef main
 
 #include <assert.h>
+#include <sys/mman.h>
 
 typedef struct {
   const char* service;
@@ -58,6 +59,112 @@ static void check_envp(int count, int dyld_at, int expected_count) {
   else assert(strcmp(envp[dyld_at], value) == 0);
 }
 
+static mach_msg_type_number_t port_name_count(void) {
+  mach_port_name_array_t names;
+  mach_port_type_array_t types;
+  mach_msg_type_number_t name_count, type_count;
+  assert(mach_port_names(mach_task_self(), &names, &name_count, &types,
+                         &type_count) == KERN_SUCCESS);
+  vm_deallocate(mach_task_self(), (vm_address_t)names,
+                name_count * sizeof(*names));
+  vm_deallocate(mach_task_self(), (vm_address_t)types,
+                type_count * sizeof(*types));
+  return name_count;
+}
+
+/* Every intercepted launch makes and releases one exception port. */
+static void check_exception_port_release(void) {
+  mach_msg_type_number_t before = port_name_count();
+  for (int i = 0; i < 1000; i++) {
+    mach_port_t port;
+    assert(make_exception_port(&port) == KERN_SUCCESS);
+    release_exception_port(port);
+  }
+  assert(port_name_count() == before);
+}
+
+/* Two pages, the second unreadable: things placed at the end of the first. */
+static char* g_pages;
+static size_t g_page;
+
+static char* at_page_end(size_t size) {
+  return g_pages + g_page - size;
+}
+
+static void check_remote_reads(void) {
+  g_page = (size_t)getpagesize();
+  g_pages = mmap(NULL, g_page * 2, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANON, -1, 0);
+  assert(g_pages != MAP_FAILED);
+  assert(mprotect(g_pages + g_page, g_page, PROT_NONE) == 0);
+
+  char buffer[64];
+  /* A short string right before the unreadable page reads in full. */
+  strcpy(at_page_end(6), "VAR=x");
+  assert(read_remote_string(mach_task_self(), (mach_vm_address_t)at_page_end(6),
+                            buffer, sizeof(buffer)) == 5);
+  assert(strcmp(buffer, "VAR=x") == 0);
+  /* A string that runs into it doesn't. */
+  memcpy(at_page_end(3), "abc", 3);
+  assert(read_remote_string(mach_task_self(), (mach_vm_address_t)at_page_end(3),
+                            buffer, sizeof(buffer)) == -1);
+  assert(read_remote_string(mach_task_self(),
+                            (mach_vm_address_t)(g_pages + g_page), buffer,
+                            sizeof(buffer)) == -1);
+  /* Longer than the buffer: cut, still terminated. */
+  memset(g_pages, 'a', 200);
+  g_pages[200] = '\0';
+  assert(read_remote_string(mach_task_self(), (mach_vm_address_t)g_pages,
+                            buffer, sizeof(buffer)) == 63);
+  assert(strlen(buffer) == 63);
+
+  uint64_t value = 1;
+  assert(read_remote_u64(mach_task_self(),
+                         (mach_vm_address_t)(g_pages + g_page), &value) == -1);
+  assert(value == 0);
+}
+
+/* An existing DYLD entry at a page's end is found and replaced, not missed and
+ * duplicated (the old fixed-size read failed there). */
+static void check_envp_dyld_at_page_end(void) {
+  const char* old = "DYLD_INSERT_LIBRARIES=old";
+  const char* value = "DYLD_INSERT_LIBRARIES=/a.dylib";
+  char* old_copy = at_page_end(strlen(old) + 1);
+  strcpy(old_copy, old);
+  static char other[] = "HOME=/x";
+  mach_vm_address_t envp[] = {(mach_vm_address_t)other,
+                              (mach_vm_address_t)old_copy, 0};
+  char** result = (char**)make_envp_with_dyld(
+      mach_task_self(), (mach_vm_address_t)envp, value);
+  assert(result != NULL);
+  assert(strcmp(result[0], "HOME=/x") == 0);
+  assert(strcmp(result[1], value) == 0);
+  assert(result[2] == NULL);
+}
+
+/* An envp array that runs into unreadable memory (no NULL we can see) is not
+ * taken as ending there: injection is skipped. */
+static void check_envp_unreadable(void) {
+  static char a[] = "A=1";
+  mach_vm_address_t* tail = (mach_vm_address_t*)(void*)at_page_end(16);
+  tail[0] = (mach_vm_address_t)a;
+  tail[1] = (mach_vm_address_t)a;
+  assert(make_envp_with_dyld(mach_task_self(), (mach_vm_address_t)tail,
+                             "DYLD_INSERT_LIBRARIES=/a.dylib") == 0);
+  /* An entry pointing at unreadable memory: skipped too. */
+  mach_vm_address_t bad[] = {(mach_vm_address_t)a,
+                             (mach_vm_address_t)(g_pages + g_page), 0};
+  assert(make_envp_with_dyld(mach_task_self(), (mach_vm_address_t)bad,
+                             "DYLD_INSERT_LIBRARIES=/a.dylib") == 0);
+}
+
+/* A path that doesn't fit is left out whole, never cut. */
+static void check_value_capacity(void) {
+  char small[sizeof("DYLD_INSERT_LIBRARIES=dynjectd.c") + 5];
+  assert(build_dyld_for_bundle("second", small, sizeof(small)));
+  assert(strcmp(small, "DYLD_INSERT_LIBRARIES=dynjectd.c") == 0);
+}
+
 int main(void) {
   log_init("test_daemon_policy", "/dev/null", 0);
   config_set_defaults();
@@ -80,6 +187,12 @@ int main(void) {
   check_envp(511, 7, 511);
   check_envp(512, -1, 0);   /* too many: skip injection rather than drop variables */
 
+  check_exception_port_release();
+  check_remote_reads();
+  check_envp_dyld_at_page_end();
+  check_envp_unreadable();
+  check_value_capacity();
+
   Worker workers[] = {
       {"first", "DYLD_INSERT_LIBRARIES=dynjectd.c"},
       {"second", "DYLD_INSERT_LIBRARIES=dynjectd.c:dynject_loader.c"},
@@ -89,6 +202,6 @@ int main(void) {
     assert(pthread_create(&threads[i], NULL, run_policy, &workers[i]) == 0);
   for (int i = 0; i < 2; i++) assert(pthread_join(threads[i], NULL) == 0);
 
-  puts("daemon policy concurrency and envp rewrite passed");
+  puts("daemon policy, envp rewrite, remote reads and port release passed");
   return 0;
 }
