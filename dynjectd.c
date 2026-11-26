@@ -19,6 +19,7 @@
 #include <ptrauth.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -167,6 +168,19 @@ static void config_load(const char* path) {
 
   while (fgets(line, sizeof(line), file) != NULL) {
     line_no++;
+
+    /* A line that doesn't fit the buffer would have its tail read as a line
+     * of its own. Drop all of it instead. */
+    len = strlen(line);
+    if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
+      int ch;
+      while ((ch = fgetc(file)) != EOF && ch != '\n') {
+      }
+      config_warn("line %d: longer than %zu bytes; ignored", line_no,
+                  sizeof(line) - 2);
+      continue;
+    }
+
     s = line;
     while (*s == ' ' || *s == '\t') {
       s++;
@@ -191,6 +205,14 @@ static void config_load(const char* path) {
     value = colon + 1;
     while (*value == ' ') {
       value++;
+    }
+
+    /* An empty rule or pattern is a substring of everything. */
+    if ((strcmp(key, "allow") == 0 || strcmp(key, "deny") == 0) &&
+        value[0] == '\0') {
+      config_warn("line %d: empty %s rule would match every process; ignored",
+                  line_no, key);
+      continue;
     }
 
     if (strcmp(key, "dylib") == 0 && g_config.dylib_count >= MAX_DYLIBS) {
@@ -242,6 +264,12 @@ static void config_load(const char* path) {
 
       p3 = p2 + 1;
       strlcpy(pattern, p3, sizeof(pattern));
+      if (pattern[0] == '\0') {
+        config_warn("line %d: dylib-override with an empty pattern would "
+                    "match every app; ignored",
+                    line_no);
+        continue;
+      }
 
       if (pending_count == pending_capacity) {
         int capacity = pending_capacity == 0 ? 16 : pending_capacity * 2;
@@ -663,6 +691,51 @@ static size_t envp_pointer_count(int existing_count, int has_dyld,
   return required <= capacity ? required : 0;
 }
 
+#define DYLD_PREFIX "DYLD_INSERT_LIBRARIES="
+#define DYLD_EXISTING_MAX 8192
+
+/* Whether `path` (path_len bytes) is one of the ':'-separated entries of
+ * `list`. */
+static int dyld_list_has(const char* list, const char* path, size_t path_len) {
+  const char* at = list;
+
+  while (*at != '\0') {
+    const char* end = strchr(at, ':');
+    size_t len = end != NULL ? (size_t)(end - at) : strlen(at);
+    if (len == path_len && memcmp(at, path, len) == 0) return 1;
+    if (end == NULL) break;
+    at = end + 1;
+  }
+  return 0;
+}
+
+/* Both arguments are whole "DYLD_INSERT_LIBRARIES=..." strings. Writes the
+ * launch's own value followed by each of ours it doesn't already list, so a
+ * job that inserts libraries of its own keeps them. Returns 0 if the result
+ * doesn't fit. */
+static int merge_dyld_values(const char* ours, const char* existing, char* out,
+                             size_t out_size) {
+  size_t prefix_len = strlen(DYLD_PREFIX);
+  const char* at = ours + prefix_len;
+
+  if (strlcpy(out, existing, out_size) >= out_size) return 0;
+  while (*at != '\0') {
+    const char* end = strchr(at, ':');
+    size_t len = end != NULL ? (size_t)(end - at) : strlen(at);
+    if (len > 0 && !dyld_list_has(out + prefix_len, at, len)) {
+      size_t used = strlen(out);
+      int needs_colon = out[prefix_len] != '\0';
+      if (used + (size_t)needs_colon + len >= out_size) return 0;
+      if (needs_colon) out[used++] = ':';
+      memcpy(out + used, at, len);
+      out[used + len] = '\0';
+    }
+    if (end == NULL) break;
+    at = end + 1;
+  }
+  return 1;
+}
+
 static mach_vm_address_t make_envp_with_dyld(
     task_t task, mach_vm_address_t original_envp_address,
     const char* dyld_value) {
@@ -729,6 +802,25 @@ static mach_vm_address_t make_envp_with_dyld(
       LOG("SKIP envp: too many entries");
       return 0;
     }
+  }
+
+  /* The launch already inserts libraries: keep them, add ours. */
+  if (dyld_entry_index >= 0) {
+    static _Thread_local char existing[DYLD_EXISTING_MAX];
+    static _Thread_local char merged[DYLD_EXISTING_MAX + 4096];
+    ssize_t existing_len = read_remote_string(
+        task, existing_ptrs[dyld_entry_index], existing, sizeof(existing));
+
+    if (existing_len < 0) {
+      LOG("SKIP envp: existing DYLD_INSERT_LIBRARIES unreadable");
+      return 0;
+    }
+    if ((size_t)existing_len >= sizeof(existing) - 1 ||
+        !merge_dyld_values(dyld_value, existing, merged, sizeof(merged))) {
+      LOG("SKIP envp: existing DYLD_INSERT_LIBRARIES too long to add to");
+      return 0;
+    }
+    dyld_value = merged;
   }
 
   dyld_string_len = strlen(dyld_value) + 1;
@@ -893,6 +985,15 @@ static kern_return_t receive_exception(mach_port_t port, int timeout_ms,
                   (mach_msg_timeout_t)timeout_ms, MACH_PORT_NULL);
 }
 
+/* Launch handlers that are running, and whether the daemon is shutting down.
+ * A thread stopped at our breakpoint needs its answer before the daemon goes,
+ * or the launch dies with the exception port. */
+static atomic_int g_active_handlers;
+static atomic_int g_stopping;
+
+#define WAIT_TASK_GONE 1
+#define WAIT_STOPPING 2
+
 /* A task's port turns into a dead name when the task ends. */
 static int task_is_gone(task_t task) {
   mach_port_type_t type = 0;
@@ -902,8 +1003,9 @@ static int task_is_gone(task_t task) {
 }
 
 /* Waits up to max_ms for a message, in slices, and gives up early if the
- * task has ended. Returns what mach_msg returned; MACH_RCV_TIMED_OUT with
- * *gone set means the task ended first. */
+ * task has ended or the daemon is stopping. Returns what mach_msg returned;
+ * with MACH_RCV_TIMED_OUT, *gone says why it ended early (WAIT_TASK_GONE,
+ * WAIT_STOPPING) or is 0 for the full time. */
 static kern_return_t wait_for_exception(mach_port_t port, task_t task,
                                         int max_ms, ExceptionRequest* request,
                                         int* gone) {
@@ -920,7 +1022,11 @@ static kern_return_t wait_for_exception(mach_port_t port, task_t task,
     waited += slice;
     if (waited >= max_ms) return kr;
     if (task_is_gone(task)) {
-      *gone = 1;
+      *gone = WAIT_TASK_GONE;
+      return kr;
+    }
+    if (atomic_load(&g_stopping)) {
+      *gone = WAIT_STOPPING;
       return kr;
     }
   }
@@ -1139,7 +1245,10 @@ static void* xpc_handler_thread(void* raw_args) {
     set_hw_bps(task, 0);
     kr = receive_exception(exc_port, 0, &exc_request);
     if (kr == MACH_RCV_TIMED_OUT) {
-      LOG("%s SKIP (%s)", service_name, gone ? "launch ended" : "timeout");
+      LOG("%s SKIP (%s)", service_name,
+          gone == WAIT_TASK_GONE ? "launch ended"
+                                 : gone == WAIT_STOPPING ? "daemon stopping"
+                                                         : "timeout");
       goto cleanup;
     }
   }
@@ -1208,6 +1317,12 @@ cleanup:
   return NULL;
 }
 
+static void* xpc_handler_entry(void* raw_args) {
+  xpc_handler_thread(raw_args);
+  atomic_fetch_sub(&g_active_handlers, 1);
+  return NULL;
+}
+
 static int spawn_xpc_handler(pid_t pid, task_t task, mach_port_t exc_port,
                              const char* service_name, size_t service_len) {
   XpcHandlerArgs* args;
@@ -1249,11 +1364,13 @@ static int spawn_xpc_handler(pid_t pid, task_t task, mach_port_t exc_port,
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-  create_result = pthread_create(&thread, &attr, xpc_handler_thread, args);
+  atomic_fetch_add(&g_active_handlers, 1);
+  create_result = pthread_create(&thread, &attr, xpc_handler_entry, args);
 
   pthread_attr_destroy(&attr);
 
   if (create_result != 0) {
+    atomic_fetch_sub(&g_active_handlers, 1);
     LOG("ERROR pthread_create: %d", create_result);
     free(args);
     return -1;
@@ -1340,15 +1457,16 @@ static const char* g_ui_bundle_patterns[] = {
 static int bundle_id_wants_injection(const char* bundle_id, size_t bundle_len) {
   int i;
 
-  for (i = 0; i < g_config.allow_count; i++) {
-    if (strnstr(bundle_id, g_config.allow_rules[i], bundle_len) != NULL) {
-      return 1;
-    }
-  }
-
+  /* deny first, as in check_match: a label that matches both is refused */
   for (i = 0; i < g_config.deny_count; i++) {
     if (strnstr(bundle_id, g_config.deny_rules[i], bundle_len) != NULL) {
       return 0;
+    }
+  }
+
+  for (i = 0; i < g_config.allow_count; i++) {
+    if (strnstr(bundle_id, g_config.allow_rules[i], bundle_len) != NULL) {
+      return 1;
     }
   }
 
@@ -1389,6 +1507,12 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
   target_process = message->event.exec.target;
 
   if (current_process == NULL || target_process == NULL) {
+    es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
+    return;
+  }
+
+  /* shutting down: let everything through untouched */
+  if (atomic_load(&g_stopping)) {
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -1484,6 +1608,38 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
   }
 
   es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
+}
+
+#define STOP_WAIT_MS 2500
+
+/* SIGTERM and SIGINT: take no new launches, let the handlers that are
+ * running answer their threads, then exit. */
+static void stop_daemon(es_client_t* client, int signal_number) {
+  int waited_ms;
+
+  if (atomic_exchange(&g_stopping, 1)) return;
+  es_unsubscribe_all(client);
+  for (waited_ms = 0;
+       waited_ms < STOP_WAIT_MS && atomic_load(&g_active_handlers) > 0;
+       waited_ms += 10) {
+    usleep(10 * 1000);
+  }
+  LOG("stopping on signal %d (%d launch(es) still in flight)", signal_number,
+      atomic_load(&g_active_handlers));
+  exit(0);
+}
+
+static void install_stop_handler(es_client_t* client, int signal_number) {
+  dispatch_source_t source;
+
+  signal(signal_number, SIG_IGN);
+  source = dispatch_source_create(
+      DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)signal_number, 0,
+      dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+  dispatch_source_set_event_handler(source, ^{
+    stop_daemon(client, signal_number);
+  });
+  dispatch_resume(source);
 }
 
 int main(int argc, char* argv[]) {
@@ -1593,6 +1749,9 @@ int main(int argc, char* argv[]) {
     es_delete_client(es_client);
     return 1;
   }
+
+  install_stop_handler(es_client, SIGTERM);
+  install_stop_handler(es_client, SIGINT);
 
   dispatch_main();
 

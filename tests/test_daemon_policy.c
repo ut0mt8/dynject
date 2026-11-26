@@ -44,6 +44,8 @@ static void check_envp(int count, int dyld_at, int expected_count) {
     return;
   }
   assert(result != 0);
+  /* a launch that inserts a library of its own keeps it, ours follows */
+  if (dyld_at >= 0) value = "DYLD_INSERT_LIBRARIES=old:/a.dylib";
   char** envp = (char**)result;
   int n = 0, dyld_seen = 0;
   while (envp[n] != NULL) {
@@ -138,7 +140,7 @@ static void check_envp_dyld_at_page_end(void) {
       mach_task_self(), (mach_vm_address_t)envp, value);
   assert(result != NULL);
   assert(strcmp(result[0], "HOME=/x") == 0);
-  assert(strcmp(result[1], value) == 0);
+  assert(strcmp(result[1], "DYLD_INSERT_LIBRARIES=old:/a.dylib") == 0);
   assert(result[2] == NULL);
 }
 
@@ -470,6 +472,24 @@ static void check_config(void) {
     assert(g_config.dylibs[0].override_count == MAX_OVERRIDES);
     assert(g_config_warning_count == 2 && warned("dylib lines") && warned("overrides for /d0.dylib"));
   }
+  /* an empty rule or pattern would match everything: ignored and reported */
+  load_config("dylib:/x.dylib:deny\ndylib-override:/x.dylib:allow:\nallow:\ndeny:\n");
+  assert(g_config.dylibs[0].override_count == 0 && g_config.allow_count == 0 && g_config.deny_count == 0);
+  assert(g_config_warning_count == 3 && warned("empty pattern") && warned("empty allow rule") && warned("empty deny rule"));
+
+  /* a line longer than the buffer is dropped whole; its tail is not a line of its own */
+  {
+    static char text[PATH_MAX + 400];
+    memset(text, 'a', sizeof(text));
+    memcpy(text, "deny:", 5);
+    size_t cut = PATH_MAX + 64 - 1; /* where the buffer ends */
+    memcpy(text + cut, "dylib:/tmp/evil.dylib\ndylib:/y.dylib\n", 37);
+    text[cut + 37] = '\0';
+    load_config(text);
+    assert(g_config.deny_count == 0);
+    assert(g_config.dylib_count == 1 && strcmp(g_config.dylibs[0].path, "/y.dylib") == 0);
+    assert(g_config_warning_count == 1 && warned("line 1: longer than"));
+  }
   unlink("build/test.conf");
   g_config = saved;
   g_config_warning_count = 0;
@@ -521,6 +541,93 @@ static void check_wait(void) {
   release_exception_port(port);
 }
 
+/* The launch's own inserted libraries stay, ours are added once. */
+static void check_dyld_merge(void) {
+  char out[64];
+  assert(merge_dyld_values("DYLD_INSERT_LIBRARIES=/a:/b", "DYLD_INSERT_LIBRARIES=/x", out, sizeof(out)));
+  assert(strcmp(out, "DYLD_INSERT_LIBRARIES=/x:/a:/b") == 0);
+  /* already there (a relaunch that inherited the variable): not twice */
+  assert(merge_dyld_values("DYLD_INSERT_LIBRARIES=/a:/b", "DYLD_INSERT_LIBRARIES=/b:/x", out, sizeof(out)));
+  assert(strcmp(out, "DYLD_INSERT_LIBRARIES=/b:/x:/a") == 0);
+  /* a name that only contains ours isn't ours */
+  assert(merge_dyld_values("DYLD_INSERT_LIBRARIES=/a", "DYLD_INSERT_LIBRARIES=/a2", out, sizeof(out)));
+  assert(strcmp(out, "DYLD_INSERT_LIBRARIES=/a2:/a") == 0);
+  /* an empty value of theirs */
+  assert(merge_dyld_values("DYLD_INSERT_LIBRARIES=/a", "DYLD_INSERT_LIBRARIES=", out, sizeof(out)));
+  assert(strcmp(out, "DYLD_INSERT_LIBRARIES=/a") == 0);
+  /* no room: refused, never cut */
+  assert(!merge_dyld_values("DYLD_INSERT_LIBRARIES=/a", "DYLD_INSERT_LIBRARIES=/x", out, 26));
+  assert(merge_dyld_values("DYLD_INSERT_LIBRARIES=/a", "DYLD_INSERT_LIBRARIES=/x", out, 28));
+
+  /* a value longer than we read is left alone: no injection rather than a cut list */
+  static char longer[DYLD_EXISTING_MAX + 64];
+  memset(longer, 'p', sizeof(longer) - 1);
+  memcpy(longer, DYLD_PREFIX "/", strlen(DYLD_PREFIX) + 1);
+  mach_vm_address_t envp[] = {(mach_vm_address_t)longer, 0};
+  assert(make_envp_with_dyld(mach_task_self(), (mach_vm_address_t)envp, "DYLD_INSERT_LIBRARIES=/a") == 0);
+}
+
+/* The label is checked like the executable: a deny rule comes first. */
+static void check_gate_order(void) {
+  static Config saved;
+  saved = g_config;
+  const char* safari = "application.com.apple.Safari.1.2";
+  strlcpy(g_config.allow_rules[0], "Safari", PATH_MAX);
+  g_config.allow_count = 1;
+  assert(bundle_id_wants_injection(safari, strlen(safari)));
+  strlcpy(g_config.deny_rules[0], "com.apple.Safari", PATH_MAX);
+  g_config.deny_count = 1;
+  assert(!bundle_id_wants_injection(safari, strlen(safari)));
+  const char* other = "application.com.example.other.1.2";
+  assert(bundle_id_wants_injection(other, strlen(other)));
+  g_config = saved;
+}
+
+/* A stopping daemon doesn't keep waiting for a breakpoint. */
+static void check_stop_ends_wait(void) {
+  ExceptionRequest received;
+  struct timespec start;
+  int gone = -1;
+  mach_port_t port = port_with_send();
+
+  atomic_store(&g_stopping, 1);
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  assert(wait_for_exception(port, mach_task_self(), 5000, &received, &gone) == MACH_RCV_TIMED_OUT);
+  assert(gone == WAIT_STOPPING && seconds_since(&start) < 1.0);
+  atomic_store(&g_stopping, 0);
+  assert(atomic_load(&g_active_handlers) == 0);
+  release_exception_port(port);
+}
+
+static void* log_many(void* context) {
+  for (int i = 0; i < 400; i++) LOG("thread %d line %d end", (int)(intptr_t)context, i);
+  return NULL;
+}
+
+/* Lines from several threads don't mix. Run last: it points the log elsewhere. */
+static void check_log_lines(void) {
+  pthread_t threads[4];
+  char line[256];
+  int lines = 0;
+
+  unlink("build/log-test.txt");
+  log_init("t", "build/log-test.txt", 0);
+  for (intptr_t i = 0; i < 4; i++) assert(pthread_create(&threads[i], NULL, log_many, (void*)i) == 0);
+  for (int i = 0; i < 4; i++) pthread_join(threads[i], NULL);
+  FILE* file = fopen("build/log-test.txt", "r");
+  assert(file != NULL);
+  while (fgets(line, sizeof(line), file) != NULL) {
+    int thread = -1, number = -1, h, m, sec;
+    char tail[8] = "";
+    assert(sscanf(line, "[t %d:%d:%d] t: thread %d line %d %7s", &h, &m, &sec, &thread, &number, tail) == 6);
+    assert(strcmp(tail, "end") == 0 && thread >= 0 && thread < 4);
+    lines++;
+  }
+  fclose(file);
+  assert(lines == 1600);
+  unlink("build/log-test.txt");
+}
+
 /* A path that doesn't fit is left out whole, never cut. */
 static void check_value_capacity(void) {
   char small[sizeof("DYLD_INSERT_LIBRARIES=dynjectd.c") + 5];
@@ -560,6 +667,9 @@ int main(void) {
   check_daemon_names();
   check_config();
   check_wait();
+  check_dyld_merge();
+  check_gate_order();
+  check_stop_ends_wait();
   check_exec_identity();
   check_copy_printable();
   check_forged_exception();
@@ -574,6 +684,7 @@ int main(void) {
     assert(pthread_create(&threads[i], NULL, run_policy, &workers[i]) == 0);
   for (int i = 0; i < 2; i++) assert(pthread_join(threads[i], NULL) == 0);
 
+  check_log_lines();
   puts("daemon policy, envp rewrite, remote reads and port release passed");
   return 0;
 }

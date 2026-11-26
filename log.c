@@ -4,6 +4,7 @@
 
 #include "log.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -27,27 +28,30 @@ void log_init(const char *program_name, const char *log_path, int verbose)
     }
 }
 
+/* One line is formatted first and written with a single call, so lines from
+ * different threads don't mix, and localtime_r keeps the time per thread. */
 void log_write(int is_verbose, const char *fmt, ...) {
     va_list    args;
     time_t     now;
-    struct tm *tm_info;
+    struct tm  tm_info;
     char       timestamp[20];
+    char       message[PATH_MAX + 512];
     FILE      *output;
 
     if (is_verbose && !g_verbose) {
         return;
     }
 
-    now     = time(NULL);
-    tm_info = localtime(&now);
-    strftime(timestamp, sizeof(timestamp), "%H:%M:%S", tm_info);
+    now = time(NULL);
+    localtime_r(&now, &tm_info);
+    strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &tm_info);
+
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
 
     output = (g_logfile != NULL) ? g_logfile : stderr;
-    fprintf(output, "[%s %s] %s: ", g_program_name, timestamp, g_program_name);
-    va_start(args, fmt);
-    vfprintf(output, fmt, args);
-    va_end(args);
-    fputc('\n', output);
+    fprintf(output, "[%s %s] %s: %s\n", g_program_name, timestamp, g_program_name, message);
 
     if (output == g_logfile) {
         fflush(output);

@@ -95,6 +95,7 @@ sudo make load
 # ── Process allow/deny rules ─────────────────────────────────────────
 # These filter by PROCESS NAME (resolved at posix_spawn time).
 # Evaluated after dylib policy, before injection.
+# A deny rule wins over an allow rule. An empty rule or pattern is ignored.
 #
 # allow:Terminal
 # allow:Safari
