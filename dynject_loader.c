@@ -96,6 +96,33 @@ static EntryState entry_state(const uint8_t* entry, const uint8_t* expected) {
   return ENTRY_UNKNOWN;
 }
 
+/* The trampoline runs a copy of the validator's first instructions at another
+ * address, which only works for instructions that don't depend on where they
+ * are. Branches, compare-and-branch, adr/adrp and pc-relative loads do; a
+ * return or an indirect branch there would mean the function is shorter than
+ * the hook. */
+static int insn_can_move(uint32_t insn) {
+  if ((insn & 0x7C000000U) == 0x14000000U) return 0; /* b, bl */
+  if ((insn & 0xFF000000U) == 0x54000000U) return 0; /* b.cond */
+  if ((insn & 0x7E000000U) == 0x34000000U) return 0; /* cbz, cbnz */
+  if ((insn & 0x7E000000U) == 0x36000000U) return 0; /* tbz, tbnz */
+  if ((insn & 0x1F000000U) == 0x10000000U) return 0; /* adr, adrp */
+  if ((insn & 0x3B000000U) == 0x18000000U) return 0; /* ldr (literal) */
+  if ((insn & 0xFE000000U) == 0xD6000000U) return 0; /* br, blr, ret */
+  return 1;
+}
+
+static int entry_can_move(const uint8_t* entry) {
+  int i;
+
+  for (i = 0; i < HOOK_SIZE; i += 4) {
+    uint32_t insn;
+    memcpy(&insn, entry + i, 4);
+    if (!insn_can_move(insn)) return 0;
+  }
+  return 1;
+}
+
 /* Fills the code page: the trampoline (the validator's first instructions and
  * a jump back into it) and the stub. Returns -1 if the stub isn't the size
  * this layout expects. */
@@ -122,9 +149,68 @@ static int build_code_page(uint8_t* page_buf, const uint8_t* original,
   return 0;
 }
 
-/* Writes HOOK_SIZE bytes over the validator's entry in amfid. */
+/* Whether a thread of the (suspended) task is about to run an instruction in
+ * [low, high). -1 if the threads couldn't be read. */
+static int task_has_pc_in(task_t task, mach_vm_address_t low,
+                          mach_vm_address_t high) {
+  thread_act_array_t threads;
+  mach_msg_type_number_t thread_count;
+  mach_msg_type_number_t i;
+  int inside = 0;
+
+  if (task_threads(task, &threads, &thread_count) != KERN_SUCCESS) return -1;
+  for (i = 0; i < thread_count; i++) {
+    arm_thread_state64_t state;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+
+    if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state,
+                         &count) == KERN_SUCCESS) {
+      mach_vm_address_t pc = (mach_vm_address_t)ptrauth_strip(
+          (void*)state.__opaque_pc, ptrauth_key_function_pointer);
+      if (pc >= low && pc < high) inside = 1;
+    }
+    mach_port_deallocate(mach_task_self(), threads[i]);
+  }
+  vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                thread_count * sizeof(thread_act_t));
+  return inside;
+}
+
+static kern_return_t write_entry_now(task_t task, mach_vm_address_t fn_addr,
+                                     const uint8_t* bytes, const char** step);
+
+/* Writes HOOK_SIZE bytes over the validator's entry in amfid, with amfid
+ * suspended and none of its threads inside those instructions: a thread that
+ * ran them half old and half new, or while the page wasn't executable, would
+ * crash amfid. The suspension ends by itself if this process dies. */
 static kern_return_t write_entry(task_t task, mach_vm_address_t fn_addr,
                                  const uint8_t* bytes, const char** step) {
+  task_suspension_token_t token = MACH_PORT_NULL;
+  kern_return_t kr = KERN_FAILURE;
+  int attempt;
+
+  for (attempt = 0; attempt < 50; attempt++) {
+    int inside;
+
+    *step = "suspend";
+    kr = task_suspend2(task, &token);
+    if (kr != KERN_SUCCESS) return kr;
+    inside = task_has_pc_in(task, fn_addr, fn_addr + HOOK_SIZE);
+    if (inside == 0) {
+      kr = write_entry_now(task, fn_addr, bytes, step);
+      task_resume2(token);
+      return kr;
+    }
+    task_resume2(token);
+    *step = inside < 0 ? "read threads" : "wait for a thread to leave the entry";
+    kr = KERN_ABORTED;
+    usleep(1000);
+  }
+  return kr;
+}
+
+static kern_return_t write_entry_now(task_t task, mach_vm_address_t fn_addr,
+                                     const uint8_t* bytes, const char** step) {
   mach_vm_address_t fn_page = fn_addr & ~(mach_vm_address_t)(PAGE_SZ - 1);
   kern_return_t kr;
 
@@ -326,6 +412,11 @@ static int install_hook(task_t task, mach_vm_address_t fn_addr,
       LOG("ERROR amfid's validator doesn't start with the expected "
           "instructions; not hooking");
       return -1;
+  }
+  if (!entry_can_move(g_patch.original)) {
+    LOG("ERROR amfid's validator starts with an instruction that can't run "
+        "from the trampoline; not hooking");
+    return -1;
   }
 
   now = counter_ticks();

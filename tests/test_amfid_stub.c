@@ -92,6 +92,31 @@ int main(void) {
     assert(entry_state(other, original) == ENTRY_UNKNOWN);
   }
 
-  puts("amfid stub: one override, self-expiring; entry states passed");
+  /* What may be copied into the trampoline. */
+  {
+    /* the validator's entry on macOS 27.2: pacibsp; sub sp; stp; stp */
+    static const uint8_t real[HOOK_SIZE] = {0x7f, 0x23, 0x03, 0xd5, 0xff, 0x43, 0x03, 0xd1,
+                                            0xfc, 0x6f, 0x07, 0xa9, 0xfa, 0x67, 0x08, 0xa9};
+    static const uint32_t cannot[] = {
+        0x14000010U, /* b */        0x94000010U, /* bl */      0x54000040U, /* b.eq */
+        0xB4000040U, /* cbz */      0x35000040U, /* cbnz */    0x36000040U, /* tbz */
+        0x10000040U, /* adr */      0x90000000U, /* adrp */    0x58000051U, /* ldr x17, literal */
+        0xD65F03C0U, /* ret */      0xD61F0220U, /* br x17 */  0xD63F0220U, /* blr x17 */
+    };
+    assert(entry_can_move(real));
+    for (size_t i = 0; i < sizeof(cannot) / sizeof(cannot[0]); i++) {
+      uint8_t entry[HOOK_SIZE];
+      memcpy(entry, real, HOOK_SIZE);
+      memcpy(entry + 8, &cannot[i], 4);
+      assert(!insn_can_move(cannot[i]));
+      assert(!entry_can_move(entry));
+    }
+    assert(insn_can_move(0xD503201FU)); /* nop */
+    assert(insn_can_move(0x910003FDU)); /* mov x29, sp */
+    /* the task has no thread in a range nothing runs in; this one is in main */
+    assert(task_has_pc_in(mach_task_self(), 0x1000, 0x1010) == 0);
+  }
+
+  puts("amfid stub: one override, self-expiring; entry states; movable entry passed");
   return 0;
 }
