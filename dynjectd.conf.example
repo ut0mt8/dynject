@@ -2,6 +2,7 @@
 #
 # Location: /opt/dynject/etc/dynjectd.conf
 # Reload:   sudo launchctl kickstart -k system/com.dynject.dynjectd
+#           (the loader stops the running dynjectd and starts a new one)
 #
 # dylib:path:allow          inject into all matched processes (default)
 # dylib:path:deny           inject into no processes unless overridden
@@ -10,8 +11,18 @@
 # dylib-override:path:allow:bundle_pattern   inject for matching bundle IDs
 # dylib-override:path:deny:bundle_pattern    skip for matching bundle IDs
 #
+# An override may stand before or after its dylib line. One that names a path
+# with no dylib line is ignored and reported in the log ("config: ...").
+#
 # bundle_pattern is matched as a substring against the XPC service bundle ID.
 # First matching override wins; falls back to the dylib's default policy.
+#
+# The service label is chosen by whoever starts the job, so for a program in
+# an app bundle the same rule is also applied to "application.<id>.", where
+# <id> is the CFBundleIdentifier in the app's own Info.plist (compared without
+# regard to case). A dylib is injected only if both say so: an allow override
+# has to match the app's identifier too, and a deny override applies if it
+# matches either.
 #
 # Examples:
 #
@@ -32,6 +43,7 @@
 # ── Process allow/deny rules ─────────────────────────────────────────
 # These filter by PROCESS NAME (resolved at posix_spawn time).
 # Evaluated after dylib policy, before injection.
+# A deny rule wins over an allow rule. An empty rule or pattern is ignored.
 #
 # allow:Terminal
 # allow:Safari
@@ -39,6 +51,7 @@
 
 # ── Default UI app rule ───────────────────────────────────────────────
 # Inject into processes inside standard .app bundles.
+# yes/no settings take yes, no, true, false, on, off, 1 or 0.
 ui_apps:yes
 
 # ── Helper filtering ──────────────────────────────────────────────────

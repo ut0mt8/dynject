@@ -3,11 +3,13 @@
  *
  */
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <EndpointSecurity/EndpointSecurity.h>
 #include <bsm/libbsm.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <mach/arm/thread_state.h>
 #include <mach/exception_types.h>
@@ -16,9 +18,13 @@
 #include <pthread.h>
 #include <ptrauth.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,7 +35,11 @@
 #define MAX_RULES 128
 
 #define HW_BP_BCR_ENABLE 0x1E5U
-#define BP_WAIT_TIMEOUT_MS 300
+/* How long a launch may take to reach posix_spawn. xpcproxy needs more than
+ * a few hundred ms on a busy system (at login, or when many apps start at
+ * once); the wait ends early when the process is gone. */
+#define BP_WAIT_TIMEOUT_MS 10000
+#define BP_WAIT_SLICE_MS 250
 
 typedef struct {
   struct {
@@ -52,10 +62,90 @@ typedef struct {
 
 static Config g_config;
 
+/* Problems found while reading the config. main() logs them once the log is
+ * open; config_load runs before that. */
+#define MAX_CONFIG_WARNINGS 16
+static char g_config_warnings[MAX_CONFIG_WARNINGS][PATH_MAX + 160];
+static int g_config_warning_count;
+
+__attribute__((format(printf, 1, 2))) static void config_warn(const char* fmt,
+                                                              ...) {
+  va_list args;
+
+  if (g_config_warning_count < MAX_CONFIG_WARNINGS) {
+    va_start(args, fmt);
+    vsnprintf(g_config_warnings[g_config_warning_count],
+              sizeof(g_config_warnings[0]), fmt, args);
+    va_end(args);
+  }
+  g_config_warning_count++;
+}
+
 static void config_set_defaults(void) {
   memset(&g_config, 0, sizeof(g_config));
   g_config.inject_ui_apps = 1;
   g_config.skip_helpers = 1;
+  g_config_warning_count = 0;
+}
+
+/* yes/no settings. Anything that isn't a known word keeps the current value
+ * and is reported, instead of counting as yes. */
+static void config_set_bool(int* setting, const char* key, const char* value,
+                            int line_no) {
+  static const char* off[] = {"no", "0", "false", "off", NULL};
+  static const char* on[] = {"yes", "1", "true", "on", NULL};
+  int i;
+
+  for (i = 0; off[i] != NULL; i++) {
+    if (strcasecmp(value, off[i]) == 0) {
+      *setting = 0;
+      return;
+    }
+  }
+  for (i = 0; on[i] != NULL; i++) {
+    if (strcasecmp(value, on[i]) == 0) {
+      *setting = 1;
+      return;
+    }
+  }
+  config_warn("line %d: %s:%s is neither yes nor no; keeping %s", line_no, key,
+              value, *setting ? "yes" : "no");
+}
+
+/* dylib-override lines as read. They are matched to their dylib once the
+ * whole file is read, so one written above its dylib line still counts. */
+typedef struct {
+  char path[PATH_MAX];
+  char pattern[256];
+  int allow;
+  int line_no;
+} PendingOverride;
+
+static void config_attach_overrides(const PendingOverride* pending,
+                                    int count) {
+  int k;
+  int i;
+
+  for (k = 0; k < count; k++) {
+    for (i = 0; i < g_config.dylib_count; i++) {
+      if (strcmp(g_config.dylibs[i].path, pending[k].path) == 0) break;
+    }
+    if (i == g_config.dylib_count) {
+      config_warn("line %d: dylib-override for %s, which has no dylib line; "
+                  "ignored",
+                  pending[k].line_no, pending[k].path);
+      continue;
+    }
+    int oi = g_config.dylibs[i].override_count;
+    if (oi >= MAX_OVERRIDES) {
+      config_warn("line %d: more than %d overrides for %s; ignored",
+                  pending[k].line_no, MAX_OVERRIDES, pending[k].path);
+      continue;
+    }
+    strlcpy(g_config.dylibs[i].overrides[oi].pattern, pending[k].pattern, 256);
+    g_config.dylibs[i].overrides[oi].allow = pending[k].allow;
+    g_config.dylibs[i].override_count++;
+  }
 }
 
 static void config_load(const char* path) {
@@ -66,6 +156,10 @@ static void config_load(const char* path) {
   char* key;
   char* value;
   size_t len;
+  PendingOverride* pending = NULL;
+  int pending_count = 0;
+  int pending_capacity = 0;
+  int line_no = 0;
 
   file = fopen(path, "r");
   if (file == NULL) {
@@ -73,6 +167,20 @@ static void config_load(const char* path) {
   }
 
   while (fgets(line, sizeof(line), file) != NULL) {
+    line_no++;
+
+    /* A line that doesn't fit the buffer would have its tail read as a line
+     * of its own. Drop all of it instead. */
+    len = strlen(line);
+    if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
+      int ch;
+      while ((ch = fgetc(file)) != EOF && ch != '\n') {
+      }
+      config_warn("line %d: longer than %zu bytes; ignored", line_no,
+                  sizeof(line) - 2);
+      continue;
+    }
+
     s = line;
     while (*s == ' ' || *s == '\t') {
       s++;
@@ -99,7 +207,19 @@ static void config_load(const char* path) {
       value++;
     }
 
-    if (strcmp(key, "dylib") == 0 && g_config.dylib_count < MAX_DYLIBS) {
+    /* An empty rule or pattern is a substring of everything. */
+    if ((strcmp(key, "allow") == 0 || strcmp(key, "deny") == 0) &&
+        value[0] == '\0') {
+      config_warn("line %d: empty %s rule would match every process; ignored",
+                  line_no, key);
+      continue;
+    }
+
+    if (strcmp(key, "dylib") == 0 && g_config.dylib_count >= MAX_DYLIBS) {
+      config_warn("line %d: more than %d dylib lines; ignored", line_no,
+                  MAX_DYLIBS);
+
+    } else if (strcmp(key, "dylib") == 0) {
       char dylib_path[PATH_MAX];
       int default_allow = 1;
       char* colon = strchr(value, ':');
@@ -125,7 +245,6 @@ static void config_load(const char* path) {
       char* p1;
       char* p2;
       char* p3;
-      int i;
 
       p1 = strchr(value, ':');
       if (p1 == NULL) continue;
@@ -145,19 +264,33 @@ static void config_load(const char* path) {
 
       p3 = p2 + 1;
       strlcpy(pattern, p3, sizeof(pattern));
+      if (pattern[0] == '\0') {
+        config_warn("line %d: dylib-override with an empty pattern would "
+                    "match every app; ignored",
+                    line_no);
+        continue;
+      }
 
-      for (i = 0; i < g_config.dylib_count; i++) {
-        if (strcmp(g_config.dylibs[i].path, dylib_path) != 0) {
+      if (pending_count == pending_capacity) {
+        int capacity = pending_capacity == 0 ? 16 : pending_capacity * 2;
+        PendingOverride* grown = realloc(pending, (size_t)capacity * sizeof(*pending));
+        if (grown == NULL) {
+          config_warn("line %d: out of memory; dylib-override ignored", line_no);
           continue;
         }
-        int oi = g_config.dylibs[i].override_count;
-        if (oi >= MAX_OVERRIDES) break;
-        strlcpy(g_config.dylibs[i].overrides[oi].pattern, pattern, 256);
-        g_config.dylibs[i].overrides[oi].allow =
-            (strcmp(policy_str, "allow") == 0) ? 1 : 0;
-        g_config.dylibs[i].override_count++;
-        break;
+        pending = grown;
+        pending_capacity = capacity;
       }
+      strlcpy(pending[pending_count].path, dylib_path, PATH_MAX);
+      strlcpy(pending[pending_count].pattern, pattern, 256);
+      pending[pending_count].allow = (strcmp(policy_str, "allow") == 0) ? 1 : 0;
+      pending[pending_count].line_no = line_no;
+      pending_count++;
+
+    } else if ((strcmp(key, "allow") == 0 && g_config.allow_count >= MAX_RULES) ||
+               (strcmp(key, "deny") == 0 && g_config.deny_count >= MAX_RULES)) {
+      config_warn("line %d: more than %d %s rules; ignored", line_no, MAX_RULES,
+                  key);
 
     } else if (strcmp(key, "allow") == 0 && g_config.allow_count < MAX_RULES) {
       strlcpy(g_config.allow_rules[g_config.allow_count], value, PATH_MAX);
@@ -168,16 +301,16 @@ static void config_load(const char* path) {
       g_config.deny_count++;
 
     } else if (strcmp(key, "ui_apps") == 0) {
-      g_config.inject_ui_apps =
-          (strcmp(value, "no") != 0 && strcmp(value, "0") != 0);
+      config_set_bool(&g_config.inject_ui_apps, key, value, line_no);
 
     } else if (strcmp(key, "skip_helpers") == 0) {
-      g_config.skip_helpers =
-          (strcmp(value, "no") != 0 && strcmp(value, "0") != 0);
+      config_set_bool(&g_config.skip_helpers, key, value, line_no);
     }
   }
 
   fclose(file);
+  config_attach_overrides(pending, pending_count);
+  free(pending);
 }
 
 typedef enum {
@@ -295,26 +428,142 @@ static int find_intercept_addresses(void) {
   return 0;
 }
 
-static char g_dyld_value[4096];
+#define INFO_PLIST_MAX (1024 * 1024)
 
-static const char* build_dyld_for_bundle(const char* bundle_id, char* out_buf,
+/* CFBundleIdentifier from one Info.plist. The file is opened without
+ * following a symlink and read with a size limit. */
+static int read_info_plist_identifier(const char* plist_path, char* out,
+                                      size_t out_size) {
+  struct stat st;
+  uint8_t* bytes = NULL;
+  CFDataRef data = NULL;
+  CFPropertyListRef plist = NULL;
+  ssize_t got = 0;
+  size_t total = 0;
+  int found = 0;
+  int fd;
+
+  fd = open(plist_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return 0;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+      st.st_size > INFO_PLIST_MAX) {
+    close(fd);
+    return 0;
+  }
+  bytes = malloc((size_t)st.st_size);
+  while (bytes != NULL && total < (size_t)st.st_size &&
+         (got = read(fd, bytes + total, (size_t)st.st_size - total)) > 0) {
+    total += (size_t)got;
+  }
+  close(fd);
+  if (bytes == NULL || total != (size_t)st.st_size) {
+    free(bytes);
+    return 0;
+  }
+
+  data = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, bytes,
+                                     (CFIndex)total, kCFAllocatorNull);
+  if (data != NULL) {
+    plist = CFPropertyListCreateWithData(kCFAllocatorDefault, data,
+                                         kCFPropertyListImmutable, NULL, NULL);
+  }
+  if (plist != NULL && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+    CFTypeRef value =
+        CFDictionaryGetValue((CFDictionaryRef)plist, CFSTR("CFBundleIdentifier"));
+    if (value != NULL && CFGetTypeID(value) == CFStringGetTypeID() &&
+        CFStringGetCString((CFStringRef)value, out, (CFIndex)out_size,
+                           kCFStringEncodingASCII) &&
+        out[0] != '\0') {
+      found = 1;
+    }
+  }
+  if (plist != NULL) CFRelease(plist);
+  if (data != NULL) CFRelease(data);
+  free(bytes);
+  if (!found && out_size > 0) out[0] = '\0';
+  return found;
+}
+
+/* The bundle identifier of the app an executable belongs to: the innermost
+ * ".app" directory in its resolved path. Returns 1 with the identifier, 0
+ * when the path is not inside an app bundle, and -1 (identifier empty) when
+ * it is but no identifier could be read. */
+static int bundle_identifier_for_executable(const char* executable_path,
+                                            char* out, size_t out_size) {
+  char resolved[PATH_MAX];
+  char plist_path[PATH_MAX];
+  const char* path = executable_path;
+  const char* scan;
+  const char* last = NULL;
+  size_t bundle_len;
+
+  if (out_size > 0) out[0] = '\0';
+  if (realpath(executable_path, resolved) != NULL) path = resolved;
+
+  for (scan = path; (scan = strstr(scan, ".app/")) != NULL; scan += 5) {
+    last = scan;
+  }
+  if (last == NULL) return 0;
+  bundle_len = (size_t)(last - path) + 4;
+
+  if (snprintf(plist_path, sizeof(plist_path), "%.*s/Contents/Info.plist",
+               (int)bundle_len, path) < (int)sizeof(plist_path) &&
+      read_info_plist_identifier(plist_path, out, out_size)) {
+    return 1;
+  }
+  if (snprintf(plist_path, sizeof(plist_path), "%.*s/Info.plist",
+               (int)bundle_len, path) < (int)sizeof(plist_path) &&
+      read_info_plist_identifier(plist_path, out, out_size)) {
+    return 1;
+  }
+  return -1;
+}
+
+/* A dylib's policy for one subject: the first override whose pattern is in
+ * it wins, else the dylib's default. */
+static int dylib_policy_for(int i, const char* subject, int ignore_case,
+                            const char** reason) {
+  int j;
+
+  for (j = 0; j < g_config.dylibs[i].override_count; j++) {
+    const char* pattern = g_config.dylibs[i].overrides[j].pattern;
+    if ((ignore_case ? strcasestr(subject, pattern) : strstr(subject, pattern)) !=
+        NULL) {
+      *reason = g_config.dylibs[i].overrides[j].allow ? "override allow"
+                                                      : "override deny";
+      return g_config.dylibs[i].overrides[j].allow;
+    }
+  }
+  *reason = g_config.dylibs[i].default_allow ? "default allow" : "default deny";
+  return g_config.dylibs[i].default_allow;
+}
+
+/* `bundle_id` is the launchd label, which whoever submits the job chooses.
+ * `verified` is "application.<bundle identifier>." built from the launched
+ * app's own Info.plist, or NULL when the program is not in an app bundle. A
+ * dylib is injected only if its policy says so for both, so a made-up label
+ * can neither pull a dylib into an app it isn't meant for nor dodge a deny. */
+static const char* build_dyld_for_bundle(const char* bundle_id,
+                                         const char* verified, char* out_buf,
                                          size_t out_size) {
   int i;
-  int j;
   int first;
 
   strlcpy(out_buf, "DYLD_INSERT_LIBRARIES=", out_size);
   first = 1;
 
   for (i = 0; i < g_config.dylib_count; i++) {
-    int should_inject = g_config.dylibs[i].default_allow;
-    const char* reason = should_inject ? "default allow" : "default deny";
+    const char* reason = "";
+    int should_inject = dylib_policy_for(i, bundle_id, 0, &reason);
 
-    for (j = 0; j < g_config.dylibs[i].override_count; j++) {
-      if (strstr(bundle_id, g_config.dylibs[i].overrides[j].pattern) != NULL) {
-        should_inject = g_config.dylibs[i].overrides[j].allow;
-        reason = should_inject ? "override allow" : "override deny";
-        break;
+    if (should_inject && verified != NULL) {
+      const char* verified_reason = "";
+      if (!dylib_policy_for(i, verified, 1, &verified_reason)) {
+        LOG("SKIP dylib[%d] %s: the label %s says inject, the app's own "
+            "identifier (%s) says %s",
+            i, g_config.dylibs[i].path, bundle_id, verified, verified_reason);
+        should_inject = 0;
+        reason = "label and app identifier disagree";
       }
     }
 
@@ -328,6 +577,15 @@ static const char* build_dyld_for_bundle(const char* bundle_id, char* out_buf,
     if (access(g_config.dylibs[i].path, F_OK) != 0) {
       LOG("SKIP dylib[%d] %s: file not found (remove from config to suppress)",
           i, g_config.dylibs[i].path);
+      continue;
+    }
+
+    /* Never hand dyld part of a path. */
+    size_t used = strlen(out_buf);
+    size_t needed = strlen(g_config.dylibs[i].path) + (!first ? 1 : 0);
+    if (needed >= out_size - used) {
+      LOG("SKIP dylib[%d] %s: injection value full", i,
+          g_config.dylibs[i].path);
       continue;
     }
 
@@ -359,44 +617,123 @@ static int dylib_count_in_value(const char* dyld_value) {
   return count;
 }
 
-static size_t read_remote_string(task_t task, mach_vm_address_t remote_address,
-                                 char* local_buffer, size_t buffer_size) {
-  mach_vm_size_t bytes_read;
-  kern_return_t kr;
+/* Reads a NUL-terminated string from the target into local_buffer. It reads at
+ * most to the next 4 KiB boundary at a time (every page boundary is one), so a
+ * short string that ends just before an unmapped page still reads. Returns the
+ * length read (local_buffer is always terminated; a string longer than
+ * buffer_size - 1 is cut there), or -1 if a page before the string's end, or
+ * the buffer's end, couldn't be read. */
+static ssize_t read_remote_string(task_t task, mach_vm_address_t remote_address,
+                                  char* local_buffer, size_t buffer_size) {
+  size_t got;
 
-  if (remote_address == 0 || local_buffer == NULL || buffer_size == 0) {
-    return 0;
+  if (local_buffer == NULL || buffer_size == 0) {
+    return -1;
+  }
+  memset(local_buffer, 0, buffer_size);
+  if (remote_address == 0) {
+    return -1;
   }
 
-  memset(local_buffer, 0, buffer_size);
+  got = 0;
+  while (got < buffer_size - 1) {
+    mach_vm_address_t address = remote_address + got;
+    size_t to_boundary = 4096 - (size_t)(address & 4095);
+    size_t want = buffer_size - 1 - got;
+    mach_vm_size_t bytes_read = 0;
+    kern_return_t kr;
 
-  bytes_read = 0;
-  kr = mach_vm_read_overwrite(task, remote_address, buffer_size - 1,
-                              (mach_vm_address_t)local_buffer, &bytes_read);
-  if (kr != KERN_SUCCESS) {
-    return 0;
+    if (want > to_boundary) {
+      want = to_boundary;
+    }
+    kr = mach_vm_read_overwrite(task, address, want,
+                                (mach_vm_address_t)(local_buffer + got),
+                                &bytes_read);
+    if (kr != KERN_SUCCESS || bytes_read != want) {
+      memset(local_buffer, 0, buffer_size);
+      return -1;
+    }
+    if (memchr(local_buffer + got, '\0', want) != NULL) {
+      return (ssize_t)strlen(local_buffer);
+    }
+    got += want;
   }
 
   local_buffer[buffer_size - 1] = '\0';
-  return (size_t)bytes_read;
+  return (ssize_t)(buffer_size - 1);
 }
 
-static uint64_t read_remote_u64(task_t task, mach_vm_address_t remote_address) {
-  uint64_t value;
+/* Returns 0 and the value, or -1 if the target's memory couldn't be read. A
+ * failed read is not the same as a NULL entry. */
+static int read_remote_u64(task_t task, mach_vm_address_t remote_address,
+                           uint64_t* value) {
   mach_vm_size_t bytes_read;
   kern_return_t kr;
 
-  value = 0;
+  *value = 0;
   bytes_read = 0;
 
-  kr = mach_vm_read_overwrite(task, remote_address, sizeof(value),
-                              (mach_vm_address_t)&value, &bytes_read);
+  kr = mach_vm_read_overwrite(task, remote_address, sizeof(*value),
+                              (mach_vm_address_t)value, &bytes_read);
 
-  if (kr != KERN_SUCCESS || bytes_read != sizeof(value)) {
-    return 0;
+  if (kr != KERN_SUCCESS || bytes_read != sizeof(*value)) {
+    *value = 0;
+    return -1;
   }
 
-  return value;
+  return 0;
+}
+
+static size_t envp_pointer_count(int existing_count, int has_dyld,
+                                 size_t capacity) {
+  if (existing_count < 0) return 0;
+  size_t required = (size_t)existing_count + (has_dyld ? 0 : 1) + 1;
+  return required <= capacity ? required : 0;
+}
+
+#define DYLD_PREFIX "DYLD_INSERT_LIBRARIES="
+#define DYLD_EXISTING_MAX 8192
+
+/* Whether `path` (path_len bytes) is one of the ':'-separated entries of
+ * `list`. */
+static int dyld_list_has(const char* list, const char* path, size_t path_len) {
+  const char* at = list;
+
+  while (*at != '\0') {
+    const char* end = strchr(at, ':');
+    size_t len = end != NULL ? (size_t)(end - at) : strlen(at);
+    if (len == path_len && memcmp(at, path, len) == 0) return 1;
+    if (end == NULL) break;
+    at = end + 1;
+  }
+  return 0;
+}
+
+/* Both arguments are whole "DYLD_INSERT_LIBRARIES=..." strings. Writes the
+ * launch's own value followed by each of ours it doesn't already list, so a
+ * job that inserts libraries of its own keeps them. Returns 0 if the result
+ * doesn't fit. */
+static int merge_dyld_values(const char* ours, const char* existing, char* out,
+                             size_t out_size) {
+  size_t prefix_len = strlen(DYLD_PREFIX);
+  const char* at = ours + prefix_len;
+
+  if (strlcpy(out, existing, out_size) >= out_size) return 0;
+  while (*at != '\0') {
+    const char* end = strchr(at, ':');
+    size_t len = end != NULL ? (size_t)(end - at) : strlen(at);
+    if (len > 0 && !dyld_list_has(out + prefix_len, at, len)) {
+      size_t used = strlen(out);
+      int needs_colon = out[prefix_len] != '\0';
+      if (used + (size_t)needs_colon + len >= out_size) return 0;
+      if (needs_colon) out[used++] = ':';
+      memcpy(out + used, at, len);
+      out[used + len] = '\0';
+    }
+    if (end == NULL) break;
+    at = end + 1;
+  }
+  return 1;
 }
 
 static mach_vm_address_t make_envp_with_dyld(
@@ -406,7 +743,8 @@ static mach_vm_address_t make_envp_with_dyld(
   int existing_count;
   int dyld_entry_index;
 
-  mach_vm_address_t new_ptr_array[512];
+  /* 511 existing entries, one new DYLD entry, and the NULL terminator. */
+  mach_vm_address_t new_ptr_array[513];
   int new_count;
 
   size_t dyld_string_len;
@@ -432,7 +770,10 @@ static mach_vm_address_t make_envp_with_dyld(
     mach_vm_address_t entry_value;
 
     probe_address = original_envp_address + (mach_vm_address_t)(i * 8);
-    entry_value = read_remote_u64(task, probe_address);
+    if (read_remote_u64(task, probe_address, &entry_value) != 0) {
+      LOG("SKIP envp: entry %d unreadable", i);
+      return 0;
+    }
 
     if (entry_value == 0) {
       break;
@@ -440,7 +781,11 @@ static mach_vm_address_t make_envp_with_dyld(
 
     existing_ptrs[existing_count] = entry_value;
 
-    read_remote_string(task, entry_value, preview, sizeof(preview));
+    /* Unreadable, we can't tell whether it's an existing DYLD entry. */
+    if (read_remote_string(task, entry_value, preview, sizeof(preview)) < 0) {
+      LOG("SKIP envp: string %d unreadable", i);
+      return 0;
+    }
     if (strncmp(preview, "DYLD_INSERT_LIBRARIES=", 22) == 0) {
       dyld_entry_index = existing_count;
     }
@@ -448,8 +793,45 @@ static mach_vm_address_t make_envp_with_dyld(
     existing_count++;
   }
 
+  /* Do not silently drop the remainder of an unusually large environment. */
+  if (i == 511) {
+    uint64_t next;
+    if (read_remote_u64(task, original_envp_address + (mach_vm_address_t)(i * 8),
+                        &next) != 0 ||
+        next != 0) {
+      LOG("SKIP envp: too many entries");
+      return 0;
+    }
+  }
+
+  /* The launch already inserts libraries: keep them, add ours. */
+  if (dyld_entry_index >= 0) {
+    static _Thread_local char existing[DYLD_EXISTING_MAX];
+    static _Thread_local char merged[DYLD_EXISTING_MAX + 4096];
+    ssize_t existing_len = read_remote_string(
+        task, existing_ptrs[dyld_entry_index], existing, sizeof(existing));
+
+    if (existing_len < 0) {
+      LOG("SKIP envp: existing DYLD_INSERT_LIBRARIES unreadable");
+      return 0;
+    }
+    if ((size_t)existing_len >= sizeof(existing) - 1 ||
+        !merge_dyld_values(dyld_value, existing, merged, sizeof(merged))) {
+      LOG("SKIP envp: existing DYLD_INSERT_LIBRARIES too long to add to");
+      return 0;
+    }
+    dyld_value = merged;
+  }
+
   dyld_string_len = strlen(dyld_value) + 1;
-  ptr_array_bytes = (size_t)(existing_count + 2) * 8;
+  size_t pointer_count = envp_pointer_count(
+      existing_count, dyld_entry_index >= 0,
+      sizeof(new_ptr_array) / sizeof(new_ptr_array[0]));
+  if (pointer_count == 0) {
+    LOG("SKIP envp: pointer array capacity exceeded");
+    return 0;
+  }
+  ptr_array_bytes = pointer_count * sizeof(new_ptr_array[0]);
   total_allocation = ptr_array_bytes + dyld_string_len + 16;
 
   allocation_base = 0;
@@ -595,9 +977,116 @@ static kern_return_t receive_exception(mach_port_t port, int timeout_ms,
   out_request->header.msgh_local_port = port;
   out_request->header.msgh_size = sizeof(*out_request);
 
-  return mach_msg(&out_request->header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
-                  sizeof(*out_request), port, (mach_msg_timeout_t)timeout_ms,
-                  MACH_PORT_NULL);
+  return mach_msg(&out_request->header,
+                  MACH_RCV_MSG | MACH_RCV_TIMEOUT |
+                      MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+                      MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
+                  0, sizeof(*out_request), port,
+                  (mach_msg_timeout_t)timeout_ms, MACH_PORT_NULL);
+}
+
+/* Launch handlers that are running, and whether the daemon is shutting down.
+ * A thread stopped at our breakpoint needs its answer before the daemon goes,
+ * or the launch dies with the exception port. */
+static atomic_int g_active_handlers;
+static atomic_int g_stopping;
+
+#define WAIT_TASK_GONE 1
+#define WAIT_STOPPING 2
+
+/* A task's port turns into a dead name when the task ends. */
+static int task_is_gone(task_t task) {
+  mach_port_type_t type = 0;
+
+  return mach_port_type(mach_task_self(), task, &type) != KERN_SUCCESS ||
+         (type & MACH_PORT_TYPE_DEAD_NAME) != 0;
+}
+
+/* Waits up to max_ms for a message, in slices, and gives up early if the
+ * task has ended or the daemon is stopping. Returns what mach_msg returned;
+ * with MACH_RCV_TIMED_OUT, *gone says why it ended early (WAIT_TASK_GONE,
+ * WAIT_STOPPING) or is 0 for the full time. */
+static kern_return_t wait_for_exception(mach_port_t port, task_t task,
+                                        int max_ms, ExceptionRequest* request,
+                                        int* gone) {
+  int waited = 0;
+
+  *gone = 0;
+  for (;;) {
+    int slice = max_ms - waited;
+    kern_return_t kr;
+
+    if (slice > BP_WAIT_SLICE_MS) slice = BP_WAIT_SLICE_MS;
+    kr = receive_exception(port, slice, request);
+    if (kr != MACH_RCV_TIMED_OUT) return kr;
+    waited += slice;
+    if (waited >= max_ms) return kr;
+    if (task_is_gone(task)) {
+      *gone = WAIT_TASK_GONE;
+      return kr;
+    }
+    if (atomic_load(&g_stopping)) {
+      *gone = WAIT_STOPPING;
+      return kr;
+    }
+  }
+}
+
+#define MACH_EXCEPTION_RAISE_ID 2405
+
+/* The target can read its own exception port (task_get_exception_ports) and
+ * send anything to it, so a received message is only used if it is a
+ * mach_exception_raise that the kernel sent: the right shape, and a sender
+ * audit token with pid 0, which no user process has. Anything else must be
+ * dropped with mach_msg_destroy and none of its fields used. */
+static int exception_request_valid(const ExceptionRequest* request) {
+  const mach_msg_header_t* header = &request->header;
+  const mach_msg_audit_trailer_t* trailer;
+  size_t fixed_size = offsetof(ExceptionRequest, codes);
+
+  if ((header->msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0 ||
+      header->msgh_id != MACH_EXCEPTION_RAISE_ID ||
+      header->msgh_size < fixed_size) {
+    return 0;
+  }
+  if (request->body.msgh_descriptor_count != 2 ||
+      request->thread_port.type != MACH_MSG_PORT_DESCRIPTOR ||
+      request->task_port.type != MACH_MSG_PORT_DESCRIPTOR ||
+      request->thread_port.disposition != MACH_MSG_TYPE_PORT_SEND ||
+      request->task_port.disposition != MACH_MSG_TYPE_PORT_SEND) {
+    return 0;
+  }
+  if (request->code_count > 2 ||
+      header->msgh_size !=
+          fixed_size + request->code_count * sizeof(request->codes[0])) {
+    return 0;
+  }
+
+  trailer = (const mach_msg_audit_trailer_t*)((const uint8_t*)request +
+                                              round_msg(header->msgh_size));
+  if ((const uint8_t*)trailer + sizeof(*trailer) >
+          (const uint8_t*)request + sizeof(*request) ||
+      trailer->msgh_trailer_size < sizeof(*trailer)) {
+    return 0;
+  }
+  return audit_token_to_pid(trailer->msgh_audit) == 0;
+}
+
+/* Copies text that came from outside (a launchd label, a path read from the
+ * target) for the log, so it can't start a new line. With ascii_only, bytes
+ * above 0x7E become '?' too. */
+static void copy_printable(char* out, size_t out_size, const char* in,
+                           size_t in_len, int ascii_only) {
+  size_t i;
+
+  if (out_size == 0) return;
+  for (i = 0; in != NULL && i < in_len && i < out_size - 1 && in[i] != '\0';
+       i++) {
+    unsigned char c = (unsigned char)in[i];
+    out[i] = (c < 0x20 || c == 0x7F || (ascii_only && c > 0x7E)) ? '?'
+                                                                 : (char)c;
+  }
+  out[i] = '\0';
 }
 
 static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
@@ -606,14 +1095,19 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
                                  arm_thread_state64_t* thread_state,
                                  mach_msg_type_number_t state_count) {
   char app_path[PATH_MAX];
+  char dyld_value[4096];
+  char app_log[NAME_MAX + 1];
   const char* app_name;
   MatchResult match_result;
   mach_vm_address_t new_envp_address;
   kern_return_t kr;
 
   /* x1 contains the path of the binary xpcproxy is about to spawn */
-  memset(app_path, 0, sizeof(app_path));
-  read_remote_string(task, thread_state->__x[1], app_path, sizeof(app_path));
+  if (read_remote_string(task, thread_state->__x[1], app_path,
+                         sizeof(app_path)) <= 0) {
+    LOG("%s SKIP (spawn path unreadable)", service_name);
+    return 0;
+  }
 
   app_name = strrchr(app_path, '/');
   if (app_name != NULL) {
@@ -622,7 +1116,8 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
     app_name = app_path;
   }
 
-  VLOG("caught pid=%d posix_spawn(%s)", (int)xpcproxy_pid, app_name);
+  copy_printable(app_log, sizeof(app_log), app_name, strlen(app_name), 0);
+  VLOG("caught pid=%d posix_spawn(%s)", (int)xpcproxy_pid, app_log);
   (void)service_name;
 
   match_result = check_match(app_name, app_path);
@@ -632,7 +1127,7 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
     return 0;
   }
 
-  VLOG("match pid=%d %s", (int)xpcproxy_pid, app_name);
+  VLOG("match pid=%d %s", (int)xpcproxy_pid, app_log);
 
   /* x5 points to xpcproxy envp array */
   if (thread_state->__x[5] == 0) {
@@ -643,15 +1138,27 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
   VLOG("policy pid=%d evaluating dylib policies for bundle: %s",
        (int)xpcproxy_pid, service_name);
 
-  build_dyld_for_bundle(service_name, g_dyld_value, sizeof(g_dyld_value));
+  {
+    char identifier[200];
+    char verified[256];
+    int in_bundle = bundle_identifier_for_executable(app_path, identifier,
+                                                     sizeof(identifier));
+    if (in_bundle != 0) {
+      /* In a bundle without a readable identifier: no allow override can
+       * match, deny overrides and defaults still apply. */
+      snprintf(verified, sizeof(verified), "application.%s.", identifier);
+    }
+    build_dyld_for_bundle(service_name, in_bundle != 0 ? verified : NULL,
+                          dyld_value, sizeof(dyld_value));
+  }
 
-  if (g_dyld_value[strlen("DYLD_INSERT_LIBRARIES=")] == '\0') {
+  if (dyld_value[strlen("DYLD_INSERT_LIBRARIES=")] == '\0') {
     LOG("%s SKIP (no dylibs allowed for this bundle)", service_name);
     return 0;
   }
 
   new_envp_address = make_envp_with_dyld(
-      task, (mach_vm_address_t)thread_state->__x[5], g_dyld_value);
+      task, (mach_vm_address_t)thread_state->__x[5], dyld_value);
 
   if (new_envp_address == 0) {
     LOG("%s SKIP (make_envp_with_dyld failed)", service_name);
@@ -667,8 +1174,8 @@ static int handle_posix_spawn_bp(task_t task, pid_t xpcproxy_pid,
     return -1;
   }
 
-  LOG("%s(%s) MATCH (%d dylib(s) injected)", service_name, app_name,
-      dylib_count_in_value(g_dyld_value));
+  LOG("%s(%s) MATCH (%d dylib(s) injected)", service_name, app_log,
+      dylib_count_in_value(dyld_value));
 
   return 1;
 }
@@ -679,6 +1186,31 @@ typedef struct {
   mach_port_t exception_port;
   char service_name[256];
 } XpcHandlerArgs;
+
+/* A receive right with one send right under the same name, which
+ * task_set_exception_ports copies into the target. */
+static kern_return_t make_exception_port(mach_port_t* port) {
+  kern_return_t kr;
+
+  *port = MACH_PORT_NULL;
+  kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, port);
+  if (kr != KERN_SUCCESS) {
+    return kr;
+  }
+  kr = mach_port_insert_right(mach_task_self(), *port, *port,
+                              MACH_MSG_TYPE_MAKE_SEND);
+  if (kr != KERN_SUCCESS) {
+    mach_port_mod_refs(mach_task_self(), *port, MACH_PORT_RIGHT_RECEIVE, -1);
+    *port = MACH_PORT_NULL;
+  }
+  return kr;
+}
+
+/* Drops both rights. Dropping only the receive right leaves the send right
+ * behind as a dead name, one per intercepted launch. */
+static void release_exception_port(mach_port_t port) {
+  mach_port_destruct(mach_task_self(), port, -1, 0);
+}
 
 static void* xpc_handler_thread(void* raw_args) {
   XpcHandlerArgs* args;
@@ -693,6 +1225,7 @@ static void* xpc_handler_thread(void* raw_args) {
   kern_return_t kr;
   char app_path[PATH_MAX];
   const char* app_name;
+  int gone;
 
   args = (XpcHandlerArgs*)raw_args;
   task = args->task;
@@ -702,15 +1235,32 @@ static void* xpc_handler_thread(void* raw_args) {
   strlcpy(service_name, args->service_name, sizeof(service_name));
   free(args);
 
-  kr = receive_exception(exc_port, BP_WAIT_TIMEOUT_MS, &exc_request);
+  kr = wait_for_exception(exc_port, task, BP_WAIT_TIMEOUT_MS, &exc_request,
+                          &gone);
 
   if (kr == MACH_RCV_TIMED_OUT) {
-    LOG("%s SKIP (timeout)", service_name);
-    goto cleanup;
+    /* Take the breakpoints out, then look once more: a thread that hit one
+     * while we were giving up is waiting for an answer, and would die with
+     * the port. */
+    set_hw_bps(task, 0);
+    kr = receive_exception(exc_port, 0, &exc_request);
+    if (kr == MACH_RCV_TIMED_OUT) {
+      LOG("%s SKIP (%s)", service_name,
+          gone == WAIT_TASK_GONE ? "launch ended"
+                                 : gone == WAIT_STOPPING ? "daemon stopping"
+                                                         : "timeout");
+      goto cleanup;
+    }
   }
 
   if (kr != MACH_MSG_SUCCESS) {
     LOG("%s SKIP (mach_msg error: %s)", service_name, mach_error_string(kr));
+    goto cleanup;
+  }
+
+  if (!exception_request_valid(&exc_request)) {
+    LOG("%s SKIP (exception message not from the kernel)", service_name);
+    mach_msg_destroy(&exc_request.header);
     goto cleanup;
   }
 
@@ -763,7 +1313,13 @@ static void* xpc_handler_thread(void* raw_args) {
 cleanup:
   set_hw_bps(task, 0);
   mach_port_deallocate(mach_task_self(), task);
-  mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+  release_exception_port(exc_port);
+  return NULL;
+}
+
+static void* xpc_handler_entry(void* raw_args) {
+  xpc_handler_thread(raw_args);
+  atomic_fetch_sub(&g_active_handlers, 1);
   return NULL;
 }
 
@@ -808,11 +1364,13 @@ static int spawn_xpc_handler(pid_t pid, task_t task, mach_port_t exc_port,
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-  create_result = pthread_create(&thread, &attr, xpc_handler_thread, args);
+  atomic_fetch_add(&g_active_handlers, 1);
+  create_result = pthread_create(&thread, &attr, xpc_handler_entry, args);
 
   pthread_attr_destroy(&attr);
 
   if (create_result != 0) {
+    atomic_fetch_sub(&g_active_handlers, 1);
     LOG("ERROR pthread_create: %d", create_result);
     free(args);
     return -1;
@@ -864,13 +1422,27 @@ static const char* g_daemon_patterns[] = {
   "siri.context.service",
   NULL };
 
+/* A name on the list counts only as a whole word of the label: it starts
+ * the label or follows a '.', and no lowercase letter follows it. So "bird"
+ * matches com.apple.bird but not an app called Thunderbird, and "logd" still
+ * matches com.apple.logd_helper. */
 static int service_name_is_system_daemon(const char* service_name,
                                          size_t service_len) {
   int i;
 
   for (i = 0; g_daemon_patterns[i] != NULL; i++) {
-    if (strnstr(service_name, g_daemon_patterns[i], service_len) != NULL) {
-      return 1;
+    const char* pattern = g_daemon_patterns[i];
+    size_t pattern_len = strlen(pattern);
+    size_t at;
+
+    for (at = 0; at + pattern_len <= service_len; at++) {
+      if (at > 0 && service_name[at - 1] != '.') continue;
+      if (memcmp(service_name + at, pattern, pattern_len) != 0) continue;
+      if (pattern[pattern_len - 1] == '.' || at + pattern_len == service_len) {
+        return 1;
+      }
+      char next = service_name[at + pattern_len];
+      if (next < 'a' || next > 'z') return 1;
     }
   }
 
@@ -885,15 +1457,16 @@ static const char* g_ui_bundle_patterns[] = {
 static int bundle_id_wants_injection(const char* bundle_id, size_t bundle_len) {
   int i;
 
-  for (i = 0; i < g_config.allow_count; i++) {
-    if (strnstr(bundle_id, g_config.allow_rules[i], bundle_len) != NULL) {
-      return 1;
-    }
-  }
-
+  /* deny first, as in check_match: a label that matches both is refused */
   for (i = 0; i < g_config.deny_count; i++) {
     if (strnstr(bundle_id, g_config.deny_rules[i], bundle_len) != NULL) {
       return 0;
+    }
+  }
+
+  for (i = 0; i < g_config.allow_count; i++) {
+    if (strnstr(bundle_id, g_config.allow_rules[i], bundle_len) != NULL) {
+      return 1;
     }
   }
 
@@ -906,10 +1479,21 @@ static int bundle_id_wants_injection(const char* bundle_id, size_t bundle_len) {
   return 0;
 }
 
+#define XPCPROXY_PATH "/usr/libexec/xpcproxy"
+
+/* Only Apple's xpcproxy: a path that merely contains "xpcproxy" lets any
+ * program have itself intercepted. */
+static int exec_target_is_xpcproxy(const char* path, size_t path_len,
+                                   int is_platform_binary) {
+  return is_platform_binary && path != NULL &&
+         path_len == strlen(XPCPROXY_PATH) &&
+         memcmp(path, XPCPROXY_PATH, path_len) == 0;
+}
+
 static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
   const es_process_t* current_process;
   const es_process_t* target_process;
-  const char* target_path;
+  char service_log[256];
   pid_t pid;
   uint32_t arg_count;
   es_string_token_t service_token;
@@ -927,12 +1511,17 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
     return;
   }
 
-  target_path = (target_process->executable != NULL)
-                    ? target_process->executable->path.data
-                    : "";
+  /* shutting down: let everything through untouched */
+  if (atomic_load(&g_stopping)) {
+    es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
+    return;
+  }
 
   /* only intercept xpcproxy */
-  if (strstr(target_path, "xpcproxy") == NULL) {
+  if (target_process->executable == NULL ||
+      !exec_target_is_xpcproxy(target_process->executable->path.data,
+                               target_process->executable->path.length,
+                               target_process->is_platform_binary)) {
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -946,21 +1535,20 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
   }
 
   service_token = es_exec_arg(&message->event.exec, 1);
-  VLOG("pid=%d %.*s evaluating bundleID", (int)pid, (int)service_token.length,
-       service_token.data);
+  copy_printable(service_log, sizeof(service_log), service_token.data,
+                 service_token.length, 1);
+  VLOG("pid=%d %s evaluating bundleID", (int)pid, service_log);
 
   if (service_token.data != NULL && service_token.length > 0) {
     if (service_name_is_system_daemon(service_token.data,
                                       service_token.length)) {
-      LOG("%.*s SKIP (system_daemon)", (int)service_token.length,
-          service_token.data);
+      LOG("%s SKIP (system_daemon)", service_log);
       es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
       return;
     }
 
     if (!bundle_id_wants_injection(service_token.data, service_token.length)) {
-      VLOG("%.*s SKIP (not UI bundle)", (int)service_token.length,
-           service_token.data);
+      VLOG("%s SKIP (not UI bundle)", service_log);
       es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
       return;
     }
@@ -982,20 +1570,10 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
 
   exc_port = MACH_PORT_NULL;
 
-  kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exc_port);
+  kr = make_exception_port(&exc_port);
   if (kr != KERN_SUCCESS) {
-    LOG("ERROR mach_port_allocate: %s", mach_error_string(kr));
+    LOG("ERROR exception port: %s", mach_error_string(kr));
     mach_port_deallocate(mach_task_self(), task);
-    es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
-    return;
-  }
-
-  kr = mach_port_insert_right(mach_task_self(), exc_port, exc_port,
-                              MACH_MSG_TYPE_MAKE_SEND);
-  if (kr != KERN_SUCCESS) {
-    LOG("ERROR mach_port_insert_right: %s", mach_error_string(kr));
-    mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -1004,19 +1582,18 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
                                 EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
                                 ARM_THREAD_STATE64);
   if (kr != KERN_SUCCESS) {
-    LOG("%.*s SKIP (task_set_exception_ports: %s)", (int)service_token.length,
-        service_token.data, mach_error_string(kr));
+    LOG("%s SKIP (task_set_exception_ports: %s)", service_log,
+        mach_error_string(kr));
     mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    release_exception_port(exc_port);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
 
   if (set_hw_bps(task, 1) != 0) {
-    LOG("%.*s SKIP (set_hw_bps failed)", (int)service_token.length,
-        service_token.data);
+    LOG("%s SKIP (set_hw_bps failed)", service_log);
     mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    release_exception_port(exc_port);
     es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return;
   }
@@ -1027,10 +1604,42 @@ static void handle_auth_exec(es_client_t* client, const es_message_t* message) {
                         service_token.length) != 0) {
     set_hw_bps(task, 0);
     mach_port_deallocate(mach_task_self(), task);
-    mach_port_mod_refs(mach_task_self(), exc_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    release_exception_port(exc_port);
   }
 
   es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
+}
+
+#define STOP_WAIT_MS 2500
+
+/* SIGTERM and SIGINT: take no new launches, let the handlers that are
+ * running answer their threads, then exit. */
+static void stop_daemon(es_client_t* client, int signal_number) {
+  int waited_ms;
+
+  if (atomic_exchange(&g_stopping, 1)) return;
+  es_unsubscribe_all(client);
+  for (waited_ms = 0;
+       waited_ms < STOP_WAIT_MS && atomic_load(&g_active_handlers) > 0;
+       waited_ms += 10) {
+    usleep(10 * 1000);
+  }
+  LOG("stopping on signal %d (%d launch(es) still in flight)", signal_number,
+      atomic_load(&g_active_handlers));
+  exit(0);
+}
+
+static void install_stop_handler(es_client_t* client, int signal_number) {
+  dispatch_source_t source;
+
+  signal(signal_number, SIG_IGN);
+  source = dispatch_source_create(
+      DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)signal_number, 0,
+      dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+  dispatch_source_set_event_handler(source, ^{
+    stop_daemon(client, signal_number);
+  });
+  dispatch_resume(source);
 }
 
 int main(int argc, char* argv[]) {
@@ -1094,6 +1703,14 @@ int main(int argc, char* argv[]) {
 
   LOG("starting");
 
+  for (i = 0; i < g_config_warning_count && i < MAX_CONFIG_WARNINGS; i++) {
+    LOG("config: %s", g_config_warnings[i]);
+  }
+  if (g_config_warning_count > MAX_CONFIG_WARNINGS) {
+    LOG("config: %d more problem(s) not shown",
+        g_config_warning_count - MAX_CONFIG_WARNINGS);
+  }
+
   for (i = 0; i < g_config.dylib_count; i++) {
     LOG("dylib[%d] %s (%s, %d override(s))", i, g_config.dylibs[i].path,
         g_config.dylibs[i].default_allow ? "allow-all" : "deny-all",
@@ -1132,6 +1749,9 @@ int main(int argc, char* argv[]) {
     es_delete_client(es_client);
     return 1;
   }
+
+  install_stop_handler(es_client, SIGTERM);
+  install_stop_handler(es_client, SIGINT);
 
   dispatch_main();
 

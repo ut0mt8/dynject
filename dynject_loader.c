@@ -10,10 +10,14 @@
 #include <mach/mach_vm.h>
 #include <objc/runtime.h>
 #include <ptrauth.h>
+#include <signal.h>
 #include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/proc.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "log.h"
@@ -26,21 +30,40 @@
 #define AMFI_SELECTOR "validateWithError:"
 
 #define HOOK_SIZE 16
-#define WAIT_MS 200
+/* The stub stops overriding by itself this long after it is installed. */
+#define GUARD_MS 300
 
 #define DEFAULT_DYNJECTD "/opt/dynject/bin/dynjectd"
 #define DEFAULT_CONFIG "/opt/dynject/etc/dynjectd.conf"
 #define DEFAULT_LOGFILE "/opt/dynject/log/dynjectd.log"
 
 #define INSN_LDR_X17_8 0x58000051U
-#define INSN_LDR_X17_20 0x580000B1U
 #define INSN_BR_X17 0xD61F0220U
-#define INSN_BLR_X17 0xD63F0220U
-#define INSN_MOVZ_X0_1 0xD2800020U
-#define INSN_STP_X29_X30 0xA9BF7BFDU
-#define INSN_LDP_X29_X30 0xA8C17BFDU
-#define INSN_RET 0xD65F03C0U
 #define PAGE_SZ 0x4000U
+
+/* Layout of the two pages allocated in amfid: code (read/execute), then one
+ * page of data that holds the stub's "used" flag. */
+#define TRAMPOLINE_OFFSET 0x00
+#define STUB_OFFSET 0x20
+#define STUB_SIZE 0x58
+#define STUB_TRAMPOLINE_LITERAL 0x40
+#define STUB_DEADLINE_LITERAL 0x48
+#define STUB_FLAG_LITERAL 0x50
+
+extern const uint8_t amfid_stub_template[];
+extern const uint8_t amfid_stub_template_end[];
+
+static uint64_t counter_ticks(void) {
+  uint64_t value;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(value));
+  return value;
+}
+
+static uint64_t counter_frequency(void) {
+  uint64_t value;
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(value));
+  return value;
+}
 
 static int g_verbose = 0;
 
@@ -48,9 +71,167 @@ static struct {
   task_t amfid_task;
   mach_vm_address_t fn_addr;
   mach_vm_address_t page_addr;
+  mach_vm_address_t flag_addr;
   uint8_t original[HOOK_SIZE];
   int active;
 } g_patch;
+
+typedef enum {
+  ENTRY_ORIGINAL, /* the validator's own first instructions */
+  ENTRY_HOOKED,   /* an entry hook, left by a loader that didn't finish */
+  ENTRY_UNKNOWN,
+} EntryState;
+
+/* `expected` is the same function in this process: amfid and the loader map
+ * the framework from the same shared cache, and only amfid's copy is ever
+ * patched. */
+static EntryState entry_state(const uint8_t* entry, const uint8_t* expected) {
+  uint32_t ldr = INSN_LDR_X17_8;
+  uint32_t br = INSN_BR_X17;
+
+  if (memcmp(entry, expected, HOOK_SIZE) == 0) return ENTRY_ORIGINAL;
+  if (memcmp(entry, &ldr, 4) == 0 && memcmp(entry + 4, &br, 4) == 0) {
+    return ENTRY_HOOKED;
+  }
+  return ENTRY_UNKNOWN;
+}
+
+/* The trampoline runs a copy of the validator's first instructions at another
+ * address, which only works for instructions that don't depend on where they
+ * are. Branches, compare-and-branch, adr/adrp and pc-relative loads do; a
+ * return or an indirect branch there would mean the function is shorter than
+ * the hook. */
+static int insn_can_move(uint32_t insn) {
+  if ((insn & 0x7C000000U) == 0x14000000U) return 0; /* b, bl */
+  if ((insn & 0xFF000000U) == 0x54000000U) return 0; /* b.cond */
+  if ((insn & 0x7E000000U) == 0x34000000U) return 0; /* cbz, cbnz */
+  if ((insn & 0x7E000000U) == 0x36000000U) return 0; /* tbz, tbnz */
+  if ((insn & 0x1F000000U) == 0x10000000U) return 0; /* adr, adrp */
+  if ((insn & 0x3B000000U) == 0x18000000U) return 0; /* ldr (literal) */
+  if ((insn & 0xFE000000U) == 0xD6000000U) return 0; /* br, blr, ret */
+  return 1;
+}
+
+static int entry_can_move(const uint8_t* entry) {
+  int i;
+
+  for (i = 0; i < HOOK_SIZE; i += 4) {
+    uint32_t insn;
+    memcpy(&insn, entry + i, 4);
+    if (!insn_can_move(insn)) return 0;
+  }
+  return 1;
+}
+
+/* Fills the code page: the trampoline (the validator's first instructions and
+ * a jump back into it) and the stub. Returns -1 if the stub isn't the size
+ * this layout expects. */
+static int build_code_page(uint8_t* page_buf, const uint8_t* original,
+                           uint64_t continue_addr, uint64_t trampoline_addr,
+                           uint64_t deadline, uint64_t flag_addr) {
+  uint32_t ldr_x17_8 = INSN_LDR_X17_8;
+  uint32_t br_x17 = INSN_BR_X17;
+  uint8_t* stub = page_buf + STUB_OFFSET;
+
+  if ((size_t)(amfid_stub_template_end - amfid_stub_template) != STUB_SIZE) {
+    return -1;
+  }
+
+  memcpy(page_buf + TRAMPOLINE_OFFSET, original, HOOK_SIZE);
+  memcpy(page_buf + TRAMPOLINE_OFFSET + 0x10, &ldr_x17_8, 4);
+  memcpy(page_buf + TRAMPOLINE_OFFSET + 0x14, &br_x17, 4);
+  memcpy(page_buf + TRAMPOLINE_OFFSET + 0x18, &continue_addr, 8);
+
+  memcpy(stub, amfid_stub_template, STUB_SIZE);
+  memcpy(stub + STUB_TRAMPOLINE_LITERAL, &trampoline_addr, 8);
+  memcpy(stub + STUB_DEADLINE_LITERAL, &deadline, 8);
+  memcpy(stub + STUB_FLAG_LITERAL, &flag_addr, 8);
+  return 0;
+}
+
+/* Whether a thread of the (suspended) task is about to run an instruction in
+ * [low, high). -1 if the threads couldn't be read. */
+static int task_has_pc_in(task_t task, mach_vm_address_t low,
+                          mach_vm_address_t high) {
+  thread_act_array_t threads;
+  mach_msg_type_number_t thread_count;
+  mach_msg_type_number_t i;
+  int inside = 0;
+
+  if (task_threads(task, &threads, &thread_count) != KERN_SUCCESS) return -1;
+  for (i = 0; i < thread_count; i++) {
+    arm_thread_state64_t state;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+
+    if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state,
+                         &count) == KERN_SUCCESS) {
+      mach_vm_address_t pc = (mach_vm_address_t)ptrauth_strip(
+          (void*)state.__opaque_pc, ptrauth_key_function_pointer);
+      if (pc >= low && pc < high) inside = 1;
+    }
+    mach_port_deallocate(mach_task_self(), threads[i]);
+  }
+  vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                thread_count * sizeof(thread_act_t));
+  return inside;
+}
+
+static kern_return_t write_entry_now(task_t task, mach_vm_address_t fn_addr,
+                                     const uint8_t* bytes, const char** step);
+
+/* Writes HOOK_SIZE bytes over the validator's entry in amfid, with amfid
+ * suspended and none of its threads inside those instructions: a thread that
+ * ran them half old and half new, or while the page wasn't executable, would
+ * crash amfid. The suspension ends by itself if this process dies. */
+static kern_return_t write_entry(task_t task, mach_vm_address_t fn_addr,
+                                 const uint8_t* bytes, const char** step) {
+  task_suspension_token_t token = MACH_PORT_NULL;
+  kern_return_t kr = KERN_FAILURE;
+  int attempt;
+
+  for (attempt = 0; attempt < 50; attempt++) {
+    int inside;
+
+    *step = "suspend";
+    kr = task_suspend2(task, &token);
+    if (kr != KERN_SUCCESS) return kr;
+    inside = task_has_pc_in(task, fn_addr, fn_addr + HOOK_SIZE);
+    if (inside == 0) {
+      kr = write_entry_now(task, fn_addr, bytes, step);
+      task_resume2(token);
+      return kr;
+    }
+    task_resume2(token);
+    *step = inside < 0 ? "read threads" : "wait for a thread to leave the entry";
+    kr = KERN_ABORTED;
+    usleep(1000);
+  }
+  return kr;
+}
+
+static kern_return_t write_entry_now(task_t task, mach_vm_address_t fn_addr,
+                                     const uint8_t* bytes, const char** step) {
+  mach_vm_address_t fn_page = fn_addr & ~(mach_vm_address_t)(PAGE_SZ - 1);
+  kern_return_t kr;
+
+  *step = "protect";
+  kr = mach_vm_protect(task, fn_page, PAGE_SZ, FALSE,
+                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+  if (kr != KERN_SUCCESS) return kr;
+
+  *step = "write";
+  kr = mach_vm_write(task, fn_addr, (vm_offset_t)bytes,
+                     (mach_msg_type_number_t)HOOK_SIZE);
+  if (kr != KERN_SUCCESS) {
+    mach_vm_protect(task, fn_page, PAGE_SZ, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    return kr;
+  }
+
+  *step = "protect back";
+  return mach_vm_protect(task, fn_page, PAGE_SZ, FALSE,
+                         VM_PROT_READ | VM_PROT_EXECUTE);
+}
 
 static pid_t find_amfid_pid(void) {
   int pid_count;
@@ -89,6 +270,70 @@ static pid_t find_amfid_pid(void) {
   return result;
 }
 
+/* Running processes with this name and owner, other than the caller. */
+static int find_processes(const char* name, uid_t uid, pid_t* out, int max) {
+  int pid_count;
+  pid_t* pid_list;
+  int found_count;
+  int count = 0;
+  int i;
+
+  pid_count = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0) / (int)sizeof(pid_t);
+  if (pid_count <= 0) return 0;
+  pid_list = calloc((size_t)pid_count, sizeof(pid_t));
+  if (pid_list == NULL) return 0;
+  found_count = proc_listpids(PROC_ALL_PIDS, 0, pid_list,
+                              pid_count * (int)sizeof(pid_t)) /
+                (int)sizeof(pid_t);
+
+  for (i = 0; i < found_count && count < max; i++) {
+    struct proc_bsdshortinfo info;
+
+    if (pid_list[i] <= 0 || pid_list[i] == getpid()) continue;
+    if (proc_pidinfo(pid_list[i], PROC_PIDT_SHORTBSDINFO, 0, &info,
+                     sizeof(info)) != (int)sizeof(info)) {
+      continue;
+    }
+    /* the kernel keeps only the first characters of a long name */
+    if (info.pbsi_uid == uid &&
+        strncmp(info.pbsi_comm, name, sizeof(info.pbsi_comm) - 1) == 0 &&
+        info.pbsi_status != SZOMB) {
+      out[count++] = pid_list[i];
+    }
+  }
+
+  free(pid_list);
+  return count;
+}
+
+/* Ends every running process with this name and owner: SIGTERM, then
+ * SIGKILL for whatever is left after grace_ms. The job can be started again
+ * while a daemon from an earlier start is still running (it is in its own
+ * process group and outlives the loader); two daemons would both intercept
+ * every launch. Returns how many were found. */
+static int stop_processes(const char* name, uid_t uid, int grace_ms) {
+  pid_t pids[64];
+  int found;
+  int waited_ms;
+  int i;
+
+  found = find_processes(name, uid, pids, 64);
+  if (found == 0) return 0;
+
+  for (i = 0; i < found; i++) kill(pids[i], SIGTERM);
+  for (waited_ms = 0; waited_ms < grace_ms; waited_ms += 20) {
+    usleep(20 * 1000);
+    if (find_processes(name, uid, pids, 64) == 0) return found;
+  }
+  i = find_processes(name, uid, pids, 64);
+  while (i-- > 0) kill(pids[i], SIGKILL);
+  for (waited_ms = 0; waited_ms < 2000; waited_ms += 20) {
+    usleep(20 * 1000);
+    if (find_processes(name, uid, pids, 64) == 0) break;
+  }
+  return found;
+}
+
 static mach_vm_address_t find_validate_imp(void) {
   void* handle;
   Class cls;
@@ -124,16 +369,19 @@ static mach_vm_address_t find_validate_imp(void) {
   return address;
 }
 
-static int install_hook(task_t task, mach_vm_address_t fn_addr) {
+static int install_hook(task_t task, mach_vm_address_t fn_addr,
+                        const uint8_t* expected_entry) {
   kern_return_t kr;
   mach_vm_size_t bytes_read;
   mach_vm_address_t page_addr;
   mach_vm_address_t trampoline_addr;
   mach_vm_address_t stub_addr;
   uint64_t continue_addr;
+  mach_vm_address_t flag_addr;
   uint8_t page_buf[PAGE_SZ];
   uint8_t entry_hook[HOOK_SIZE];
-  mach_vm_address_t fn_page;
+  uint64_t now, ticks_per_ms, deadline;
+  const char* step = "";
 
   bytes_read = 0;
   kr = mach_vm_read_overwrite(task, fn_addr, HOOK_SIZE,
@@ -143,52 +391,67 @@ static int install_hook(task_t task, mach_vm_address_t fn_addr) {
     return -1;
   }
 
+  switch (entry_state(g_patch.original, expected_entry)) {
+    case ENTRY_ORIGINAL:
+      break;
+    case ENTRY_HOOKED:
+      /* A loader that was killed before it removed its hook. Put the
+       * validator's own instructions back before hooking again, or the
+       * trampoline would copy the old hook instead of them. */
+      kr = write_entry(task, fn_addr, expected_entry, &step);
+      if (kr != KERN_SUCCESS) {
+        LOG("ERROR amfid still has an earlier hook and restoring it failed "
+            "(%s: %s)",
+            step, mach_error_string(kr));
+        return -1;
+      }
+      LOG("restored amfid's validator from a hook an earlier loader left");
+      memcpy(g_patch.original, expected_entry, HOOK_SIZE);
+      break;
+    default:
+      LOG("ERROR amfid's validator doesn't start with the expected "
+          "instructions; not hooking");
+      return -1;
+  }
+  if (!entry_can_move(g_patch.original)) {
+    LOG("ERROR amfid's validator starts with an instruction that can't run "
+        "from the trampoline; not hooking");
+    return -1;
+  }
+
+  now = counter_ticks();
+  ticks_per_ms = counter_frequency() / 1000;
+  if (ticks_per_ms == 0 || ticks_per_ms > (UINT64_MAX - now) / GUARD_MS) {
+    LOG("ERROR unusable counter for the override deadline");
+    return -1;
+  }
+  deadline = now + ticks_per_ms * GUARD_MS;
+
   page_addr = 0;
-  kr = mach_vm_allocate(task, &page_addr, PAGE_SZ, VM_FLAGS_ANYWHERE);
+  kr = mach_vm_allocate(task, &page_addr, 2 * PAGE_SZ, VM_FLAGS_ANYWHERE);
   if (kr != KERN_SUCCESS) {
     LOG("ERROR mach_vm_allocate: %s", mach_error_string(kr));
     return -1;
   }
 
-  trampoline_addr = page_addr + 0x00;
-  stub_addr = page_addr + 0x20;
+  trampoline_addr = page_addr + TRAMPOLINE_OFFSET;
+  stub_addr = page_addr + STUB_OFFSET;
+  flag_addr = page_addr + PAGE_SZ; /* zero-filled: not used yet */
   continue_addr = (uint64_t)(fn_addr + HOOK_SIZE);
 
   memset(page_buf, 0, sizeof(page_buf));
-
-  /* trampoline */
-  memcpy(page_buf + 0x00, g_patch.original, HOOK_SIZE);
-
-  {
-    uint32_t ldr_x17_8 = INSN_LDR_X17_8;
-    uint32_t br_x17 = INSN_BR_X17;
-    memcpy(page_buf + 0x10, &ldr_x17_8, 4);
-    memcpy(page_buf + 0x14, &br_x17, 4);
-    memcpy(page_buf + 0x18, &continue_addr, 8);
-  }
-
-  /* stub */
-  {
-    uint32_t stp = INSN_STP_X29_X30;
-    uint32_t ldr_x17_20 = INSN_LDR_X17_20;
-    uint32_t blr_x17 = INSN_BLR_X17;
-    uint32_t movz_x0_1 = INSN_MOVZ_X0_1;
-    uint32_t ldp = INSN_LDP_X29_X30;
-    uint32_t ret_insn = INSN_RET;
-    memcpy(page_buf + 0x20, &stp, 4);
-    memcpy(page_buf + 0x24, &ldr_x17_20, 4);
-    memcpy(page_buf + 0x28, &blr_x17, 4);
-    memcpy(page_buf + 0x2C, &movz_x0_1, 4);
-    memcpy(page_buf + 0x30, &ldp, 4);
-    memcpy(page_buf + 0x34, &ret_insn, 4);
-    memcpy(page_buf + 0x38, &trampoline_addr, 8);
+  if (build_code_page(page_buf, g_patch.original, continue_addr,
+                      trampoline_addr, deadline, flag_addr) != 0) {
+    LOG("ERROR stub has an unexpected size");
+    mach_vm_deallocate(task, page_addr, 2 * PAGE_SZ);
+    return -1;
   }
 
   kr = mach_vm_write(task, page_addr, (vm_offset_t)page_buf,
                      (mach_msg_type_number_t)PAGE_SZ);
   if (kr != KERN_SUCCESS) {
     LOG("ERROR mach_vm_write (page): %s", mach_error_string(kr));
-    mach_vm_deallocate(task, page_addr, PAGE_SZ);
+    mach_vm_deallocate(task, page_addr, 2 * PAGE_SZ);
     return -1;
   }
 
@@ -196,7 +459,7 @@ static int install_hook(task_t task, mach_vm_address_t fn_addr) {
                        VM_PROT_READ | VM_PROT_EXECUTE);
   if (kr != KERN_SUCCESS) {
     LOG("ERROR mach_vm_protect (page RX): %s", mach_error_string(kr));
-    mach_vm_deallocate(task, page_addr, PAGE_SZ);
+    mach_vm_deallocate(task, page_addr, 2 * PAGE_SZ);
     return -1;
   }
 
@@ -210,73 +473,63 @@ static int install_hook(task_t task, mach_vm_address_t fn_addr) {
   }
 
   /* cow-patch fn_addr with the entry hook */
-  fn_page = fn_addr & ~(mach_vm_address_t)(PAGE_SZ - 1);
-
-  kr = mach_vm_protect(task, fn_page, PAGE_SZ, FALSE,
-                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-  if (kr != KERN_SUCCESS) {
-    LOG("ERROR mach_vm_protect (fn RW|COPY): %s", mach_error_string(kr));
-    mach_vm_deallocate(task, page_addr, PAGE_SZ);
+  kr = write_entry(task, fn_addr, entry_hook, &step);
+  if (kr != KERN_SUCCESS && strcmp(step, "protect back") != 0) {
+    LOG("ERROR entry hook (%s): %s", step, mach_error_string(kr));
+    mach_vm_deallocate(task, page_addr, 2 * PAGE_SZ);
     return -1;
   }
-
-  kr = mach_vm_write(task, fn_addr, (vm_offset_t)entry_hook,
-                     (mach_msg_type_number_t)HOOK_SIZE);
   if (kr != KERN_SUCCESS) {
-    LOG("ERROR mach_vm_write (entry hook): %s", mach_error_string(kr));
-    mach_vm_protect(task, fn_page, PAGE_SZ, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
-    mach_vm_deallocate(task, page_addr, PAGE_SZ);
-    return -1;
-  }
-
-  kr = mach_vm_protect(task, fn_page, PAGE_SZ, FALSE,
-                       VM_PROT_READ | VM_PROT_EXECUTE);
-  if (kr != KERN_SUCCESS) {
-    LOG("EROOR mach_vm_protect (fn RX): %s", mach_error_string(kr));
+    LOG("ERROR mach_vm_protect (fn RX): %s", mach_error_string(kr));
   }
 
   VLOG("stub        @ 0x%llx", (unsigned long long)stub_addr);
   VLOG("trampoline  @ 0x%llx", (unsigned long long)trampoline_addr);
   VLOG("entry hook  @ 0x%llx (16 bytes)", (unsigned long long)fn_addr);
+  VLOG("one override, ending by itself within %dms", GUARD_MS);
 
   g_patch.amfid_task = task;
   g_patch.fn_addr = fn_addr;
   g_patch.page_addr = page_addr;
+  g_patch.flag_addr = flag_addr;
   g_patch.active = 1;
   return 0;
 }
 
+/* Whether the stub has used its one override: 1 or 0, -1 if amfid's memory
+ * couldn't be read. */
+static int override_used(void) {
+  uint32_t used = 0;
+  mach_vm_size_t bytes_read = 0;
+  kern_return_t kr;
+
+  kr = mach_vm_read_overwrite(g_patch.amfid_task, g_patch.flag_addr,
+                              sizeof(used), (mach_vm_address_t)&used,
+                              &bytes_read);
+  if (kr != KERN_SUCCESS || bytes_read != sizeof(used)) return -1;
+  return used != 0;
+}
+
 static void remove_hook(void) {
-  mach_vm_address_t fn_page;
+  const char* step = "";
   kern_return_t kr;
 
   if (!g_patch.active) {
     return;
   }
 
-  fn_page = g_patch.fn_addr & ~(mach_vm_address_t)(PAGE_SZ - 1);
-
-  kr = mach_vm_protect(g_patch.amfid_task, fn_page, PAGE_SZ, FALSE,
-                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-  if (kr == KERN_SUCCESS) {
-    kr = mach_vm_write(g_patch.amfid_task, g_patch.fn_addr,
-                       (vm_offset_t)g_patch.original,
-                       (mach_msg_type_number_t)HOOK_SIZE);
-    if (kr == KERN_SUCCESS) {
-      mach_vm_protect(g_patch.amfid_task, fn_page, PAGE_SZ, FALSE,
-                      VM_PROT_READ | VM_PROT_EXECUTE);
-      VLOG("restored validateWithError: normal validation active");
-    } else {
-      LOG("ERROR restore write failed: %s amfid hook remains",
-          mach_error_string(kr));
-    }
+  kr = write_entry(g_patch.amfid_task, g_patch.fn_addr, g_patch.original,
+                   &step);
+  if (kr == KERN_SUCCESS || strcmp(step, "protect back") == 0) {
+    VLOG("restored validateWithError: normal validation active");
   } else {
-    LOG("ERROR restore protect failed: %s amfid hook remains",
-        mach_error_string(kr));
+    LOG("ERROR restore %s failed: %s; the entry hook remains, its stub stops "
+        "overriding after one use or %dms",
+        step, mach_error_string(kr), GUARD_MS);
   }
 
-  mach_vm_deallocate(g_patch.amfid_task, g_patch.page_addr, PAGE_SZ);
+  /* The two pages stay mapped: a validation that was already running when
+   * the entry was restored still returns through the stub. */
   mach_port_deallocate(mach_task_self(), g_patch.amfid_task);
 
   memset(&g_patch, 0, sizeof(g_patch));
@@ -328,6 +581,9 @@ int main(int argc, char* argv[]) {
   pid_t dynjectd_pid;
   kern_return_t kr;
   int i;
+  int used;
+  int stopped;
+  int child_status;
 
   const char* log_path = DEFAULT_LOGFILE;
 
@@ -367,6 +623,17 @@ int main(int argc, char* argv[]) {
 
   LOG("dynject_loader");
 
+  /* one daemon at a time */
+  {
+    const char* daemon_name = strrchr(dynjectd_path, '/');
+    daemon_name = daemon_name != NULL ? daemon_name + 1 : dynjectd_path;
+    stopped = stop_processes(daemon_name, 0, 3000);
+    if (stopped > 0) {
+      LOG("stopped %d running %s before starting a new one", stopped,
+          daemon_name);
+    }
+  }
+
   /* find amfid */
   amfid_pid = find_amfid_pid();
   if (amfid_pid < 0) {
@@ -394,7 +661,8 @@ int main(int argc, char* argv[]) {
        (unsigned long long)imp_address);
 
   /* install trampoline hook */
-  if (install_hook(amfid_task, imp_address) != 0) {
+  if (install_hook(amfid_task, imp_address,
+                   (const uint8_t*)(uintptr_t)imp_address) != 0) {
     mach_port_deallocate(mach_task_self(), amfid_task);
     return 1;
   }
@@ -409,11 +677,31 @@ int main(int argc, char* argv[]) {
   }
   VLOG("launched dynjectd pid=%d", (int)dynjectd_pid);
 
-  VLOG("waiting %dms for entitlement validation", WAIT_MS);
-  usleep((useconds_t)WAIT_MS * 1000);
+  /* The kernel has amfid check dynjectd's signature during the spawn, so by
+   * now the one approval has been used, or wasn't needed because the kernel
+   * already knows this file's signature. Either way the hook can go. */
+  used = override_used();
 
   /* restore amfid */
   remove_hook();
-  LOG("done dynjectd running (pid=%d)", (int)dynjectd_pid);
+
+  usleep(20 * 1000);
+  if (waitpid(dynjectd_pid, &child_status, WNOHANG) == dynjectd_pid) {
+    if (used == 1) {
+      LOG("ERROR dynjectd (pid=%d) exited although one signature was "
+          "approved in the window: the approval may have gone to another "
+          "program",
+          (int)dynjectd_pid);
+    } else {
+      LOG("ERROR dynjectd (pid=%d) exited right after launch",
+          (int)dynjectd_pid);
+    }
+    return 1;
+  }
+
+  LOG("done dynjectd running (pid=%d); amfid hook removed (%s)",
+      (int)dynjectd_pid,
+      used == 1 ? "one signature approved"
+                : used == 0 ? "no approval was needed" : "state unreadable");
   return 0;
 }

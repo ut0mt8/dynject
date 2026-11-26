@@ -54,6 +54,7 @@ sudo make load
 #
 # Location: /opt/dynject/etc/dynjectd.conf
 # Reload:   sudo launchctl kickstart -k system/com.dynject.dynjectd
+#           (the loader stops the running dynjectd and starts a new one)
 #
 # dylib:path:allow          inject into all matched processes (default)
 # dylib:path:deny           inject into no processes unless overridden
@@ -62,8 +63,18 @@ sudo make load
 # dylib-override:path:allow:bundle_pattern   inject for matching bundle IDs
 # dylib-override:path:deny:bundle_pattern    skip for matching bundle IDs
 #
+# An override may stand before or after its dylib line. One that names a path
+# with no dylib line is ignored and reported in the log ("config: ...").
+#
 # bundle_pattern is matched as a substring against the XPC service bundle ID.
 # First matching override wins; falls back to the dylib's default policy.
+#
+# The service label is chosen by whoever starts the job, so for a program in
+# an app bundle the same rule is also applied to "application.<id>.", where
+# <id> is the CFBundleIdentifier in the app's own Info.plist (compared without
+# regard to case). A dylib is injected only if both say so: an allow override
+# has to match the app's identifier too, and a deny override applies if it
+# matches either.
 #
 # Examples:
 #
@@ -84,6 +95,7 @@ sudo make load
 # ── Process allow/deny rules ─────────────────────────────────────────
 # These filter by PROCESS NAME (resolved at posix_spawn time).
 # Evaluated after dylib policy, before injection.
+# A deny rule wins over an allow rule. An empty rule or pattern is ignored.
 #
 # allow:Terminal
 # allow:Safari
@@ -91,6 +103,7 @@ sudo make load
 
 # ── Default UI app rule ───────────────────────────────────────────────
 # Inject into processes inside standard .app bundles.
+# yes/no settings take yes, no, true, false, on, off, 1 or 0.
 ui_apps:yes
 
 # ── Helper filtering ──────────────────────────────────────────────────
@@ -105,12 +118,18 @@ skip_helpers:yes
 
 The LaunchDaemon (`/Library/LaunchDaemons/com.dynject.dynjectd.plist`) runs
 `dynject_loader` which:
-1. Hooks amfid's validation method with a trampoline (real validation runs,
-   return value is forced to YES)
+1. Hooks amfid's validation method with a trampoline (real validation runs;
+   one failed result is turned into YES, once)
 2. Launches dynjectd (whose entitlements are approved by the hook)
-3. Waits for the kernel/amfid round-trip to complete
-4. Restores amfid to its original state
-5. Exits
+3. Removes the hook as soon as the launch returns (the kernel has amfid check
+   the signature during the launch)
+4. Exits
+
+The hook approves a single signature and stops by itself after 300 ms, so it
+ends even if the loader is killed before step 3; the next run then puts
+amfid's original instructions back before hooking again. If another program
+gets its signature approved in that window instead of dynjectd, dynjectd fails
+to start and the loader logs an error.
 
 dynjectd then runs continuously, intercepting app launches.
 
